@@ -1,0 +1,1063 @@
+r"""Caption-free visual memory prototype for the released OneStreamer/Qwen3-VL.
+
+This is an independent entry point; it does not change the official eval queue.
+Example (from the repository root, using the official inference environment)::
+
+    python Eval/Proactive_Eval/OneStreamer/src/onestreamer/visual_memory.py \
+        --manifest /path/to/official/manifest.json \
+        --model-path /path/to/OneStreamer-4B --video-root /path/to/OVOBench \
+        --output /path/to/new-visual-run --limit 20 --dry-run
+
+Remove --dry-run to infer. --samples accepts the official sample JSON/JSONL
+format instead of a manifest. No caption writer is imported or executed.
+
+--history-compression avg_pool encodes each 1-fps stream observation once,
+keeps the newest N full feature bundles (--recent-frames, default 16), and spatially pools evicted features
+(including all DeepStack branches) into a bounded CPU history bank.
+progressive_pool additionally pools each archived frame every configured age
+interval, down to one token, and drops the oldest records when caps are exceeded.
+The default
+resize mode instead encodes lower-resolution historical images and replays the
+official recent-frame decoder. resize/avg_pool use a seeded reservoir; readout
+uses fixed-budget temporal selection, or --history-read-mode fill to use the
+remaining context after the configured recent window, question/formatting and answer reservation.
+--context-tokens sets a total cap (default 32768), bounded by the model config.
+These are baselines, not a novel compression or query-aware retrieval algorithm.
+The memory policy is model independent;
+the feature adapter is deliberately limited to Qwen3-VL/Transformers 4.57.6.
+
+Frames are observed causally from the evaluated stream start; discarded evidence
+is never reconstructed. Pooling mode's recent window is a fixed-origin streaming FIFO,
+which has a different sampling phase from the official end-aligned recent frames.
+Use the same pooling mode with --history-capacity 0 as its recent-only control.
+Source pixels are preserved when encoding recent frames in both modes.
+All ingestion, recent decoding/encoding, readout and QA time is reported.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import OrderedDict, deque
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+import hashlib
+import heapq
+import json
+import math
+from pathlib import Path
+import random
+import sys
+import threading
+import time
+from typing import Any
+
+
+VERSION = "visual_memory_v4_configurable_recent"
+DEFAULT_CONTEXT_TOKENS = 32768
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    capacity: int = 64
+    store_tokens: int = 16384
+    store_bytes: int = 512 * 1024**2
+    read_frames: int = 4
+    read_tokens: int = 1024
+    history_fps: float = 1.0
+    history_max_pixels: int = 262144
+    seed: int = 0
+    read_mode: str = "fixed"
+    context_tokens: int | None = DEFAULT_CONTEXT_TOKENS
+    history_compression: str = "resize"
+    pool_stride: int = 2
+    pool_age_seconds: float = 60.0
+    recent_frames: int = 16
+
+    def __post_init__(self):
+        for name in ("capacity", "store_tokens", "store_bytes", "read_frames", "read_tokens"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if not math.isfinite(self.history_fps) or self.history_fps <= 0:
+            raise ValueError("history_fps must be finite and positive")
+        if self.history_max_pixels < 1024:
+            raise ValueError("history_max_pixels must be at least 1024")
+        if self.read_mode not in {"fixed", "fill"}:
+            raise ValueError("read_mode must be fixed or fill")
+        if self.context_tokens is not None and (
+                not isinstance(self.context_tokens, int) or isinstance(self.context_tokens, bool)
+                or self.context_tokens <= 0):
+            raise ValueError("context_tokens must be a positive integer")
+        if self.history_compression not in {"resize", "avg_pool", "progressive_pool"}:
+            raise ValueError("Unknown history_compression mode")
+        if not isinstance(self.pool_stride, int) or isinstance(self.pool_stride, bool) or self.pool_stride < 1:
+            raise ValueError("pool_stride must be a positive integer")
+        if self.history_compression in {"avg_pool", "progressive_pool"} and self.history_fps != 1.0:
+            raise ValueError("Feature pooling uses a shared 1-fps stream for recent frames and history")
+        if not math.isfinite(self.pool_age_seconds) or self.pool_age_seconds <= 0:
+            raise ValueError("pool_age_seconds must be finite and positive")
+        if self.history_compression == "progressive_pool" and self.pool_stride < 2:
+            raise ValueError("Progressive pooling requires pool_stride >= 2")
+        if (not isinstance(self.recent_frames, int) or isinstance(self.recent_frames, bool)
+                or self.recent_frames <= 0):
+            raise ValueError("recent_frames must be a positive integer")
+
+    @property
+    def enabled(self):
+        return all((self.capacity, self.store_tokens, self.store_bytes)) and (
+            self.read_mode == "fill" or all((self.read_frames, self.read_tokens)))
+
+
+@dataclass(frozen=True)
+class VisualFrame:
+    timestamp: float
+    grid_thw: tuple[int, int, int]
+    features: Any
+    deepstack: tuple[Any, ...]
+    size: tuple[int, int]
+    source_size: tuple[int, int] | None = None
+    pool_source_shape: tuple[int, int] | None = None
+    pool_scale: int = 1
+
+    @property
+    def token_count(self):
+        return int(self.features.shape[0])
+
+    @property
+    def nbytes(self):
+        """Tensor payload, including every DeepStack branch; not allocator RSS."""
+        return sum(x.numel() * x.element_size() for x in (self.features, *self.deepstack))
+
+
+def pool_visual_frame(frame: VisualFrame, stride: int = 2, merge_size: int = 2) -> VisualFrame:
+    """Pool a merged spatial grid, with every DeepStack branch and area weights.
+
+    Qwen3-VL 4.57.6 outputs merged image tokens in row-major spatial order.
+    The result is a *synthetic coarse grid*, not the native encoding of a
+    smaller image. Original cell areas weight repeated pooling, so odd boundary
+    cells are not overrepresented. It owns independent CPU tensors.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if any(not isinstance(x, int) or isinstance(x, bool) or x < 1 for x in (stride, merge_size)):
+        raise ValueError("Pooling stride and merge size must be positive integers")
+    if len(frame.grid_thw) != 3 or frame.grid_thw[0] != 1:
+        raise ValueError("Feature pooling supports image grids with t=1 only")
+    _, grid_h, grid_w = frame.grid_thw
+    if min(grid_h, grid_w) <= 0 or grid_h % merge_size or grid_w % merge_size:
+        raise ValueError("Grid must be positive and divisible by merge size")
+    height, width = grid_h // merge_size, grid_w // merge_size
+    if frame.features.ndim != 2 or frame.features.shape[0] != height * width:
+        raise ValueError("Feature shape does not match merged spatial grid")
+    if (frame.size[0] % grid_w or frame.size[1] % grid_h
+            or frame.size[0] // grid_w != frame.size[1] // grid_h
+            or min(frame.size) <= 0):
+        raise ValueError("Carrier size does not match a square-patch grid")
+    patch_size = frame.size[0] // grid_w
+    source_shape = frame.pool_source_shape or (height, width)
+    if (not isinstance(frame.pool_scale, int) or isinstance(frame.pool_scale, bool)
+            or frame.pool_scale < 1 or len(source_shape) != 2
+            or any(not isinstance(x, int) or isinstance(x, bool) or x < 1 for x in source_shape)
+            or (frame.pool_source_shape is None and frame.pool_scale != 1)
+            or (math.ceil(source_shape[0] / frame.pool_scale),
+                math.ceil(source_shape[1] / frame.pool_scale)) != (height, width)):
+        raise ValueError("Original pooling geometry does not match the current grid")
+    identity = stride == 1 or height * width == 1
+    target_h, target_w = (height, width) if identity else (math.ceil(height / stride), math.ceil(width / stride))
+    weights = denominator = None
+    if not identity:
+        row_mass = torch.tensor([min(frame.pool_scale, source_shape[0] - i * frame.pool_scale)
+                                 for i in range(height)], device=frame.features.device, dtype=torch.float32)
+        col_mass = torch.tensor([min(frame.pool_scale, source_shape[1] - i * frame.pool_scale)
+                                 for i in range(width)], device=frame.features.device, dtype=torch.float32)
+        weights = (row_mass[:, None] * col_mass[None, :])[None, None]
+        denominator = F.avg_pool2d(weights, kernel_size=stride, stride=stride,
+                                   ceil_mode=True, count_include_pad=False)
+
+    def pool(tensor):
+        if tuple(tensor.shape) != tuple(frame.features.shape) or not tensor.is_floating_point():
+            raise ValueError("All feature branches must share a floating-point spatial shape")
+        if identity:
+            return tensor.detach().to("cpu", copy=True)
+        with torch.inference_mode():
+            spatial = tensor.detach().reshape(height, width, -1).permute(2, 0, 1).unsqueeze(0)
+            pooled = F.avg_pool2d(spatial.float() * weights.to(tensor.device), kernel_size=stride,
+                                  stride=stride, ceil_mode=True, count_include_pad=False)
+            pooled = pooled / denominator.to(tensor.device)
+            flat = pooled.squeeze(0).permute(1, 2, 0).reshape(target_h * target_w, -1)
+            return flat.to(device="cpu", dtype=tensor.dtype, copy=True)
+
+    return VisualFrame(frame.timestamp, (1, target_h * merge_size, target_w * merge_size),
+                       pool(frame.features), tuple(pool(x) for x in frame.deepstack),
+                       (target_w * merge_size * patch_size, target_h * merge_size * patch_size),
+                       source_size=frame.source_size, pool_source_shape=source_shape,
+                       pool_scale=frame.pool_scale if identity else frame.pool_scale * stride)
+
+
+class RecentFeatureWindow:
+    """Keep full features until an incoming frame evicts the oldest observation."""
+
+    def __init__(self, capacity=16):
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+            raise ValueError("Recent capacity must be a positive integer")
+        self.capacity = capacity
+        self._frames = deque()
+        self._last_timestamp = -math.inf
+
+    def observe(self, frame: VisualFrame):
+        if not math.isfinite(frame.timestamp) or frame.timestamp <= self._last_timestamp:
+            raise ValueError("Recent timestamps must be finite and strictly increasing")
+        self._last_timestamp = frame.timestamp
+        self._frames.append(frame)
+        return self._frames.popleft() if len(self._frames) > self.capacity else None
+
+    def frames(self):
+        return list(self._frames)
+
+
+def uniform_indices(length: int, count: int) -> list[int]:
+    count = min(length, count)
+    if count <= 0:
+        return []
+    if count == 1:
+        return [(length - 1) // 2]
+    return [round(i * (length - 1) / (count - 1)) for i in range(count)]
+
+
+class VisualMemoryBank:
+    """Query-blind random-priority reservoir under frame/token/payload caps.
+
+    Equal-size records give uniform reservoir retention. Variable-size records
+    additionally undergo budget eviction, so uniform inclusion is not claimed.
+    The resize writer may store recent samples; readout always excludes them.
+    The feature-pooling writer admits frames only after recent-FIFO eviction.
+    """
+
+    def __init__(self, config: MemoryConfig):
+        self.config = config
+        self._rng = random.Random(config.seed)
+        self._items = []
+        self._last_timestamp = -math.inf
+        self._seen = 0
+        self._oversize = 0
+
+    def observe(self, frame: VisualFrame):
+        if not math.isfinite(frame.timestamp) or frame.timestamp <= self._last_timestamp:
+            raise ValueError("Observed timestamps must be finite and strictly increasing")
+        if frame.token_count <= 0:
+            raise ValueError("A visual frame must contain tokens")
+        self._last_timestamp = frame.timestamp
+        self._seen += 1
+        cfg = self.config
+        if frame.token_count > cfg.store_tokens or frame.nbytes > cfg.store_bytes:
+            self._oversize += 1
+            return
+        if not cfg.capacity:
+            return
+        self._items.append((self._rng.random(), self._seen, frame))
+        self._items.sort(key=lambda entry: (entry[0], entry[1]))
+        while (len(self._items) > cfg.capacity
+               or sum(x[2].token_count for x in self._items) > cfg.store_tokens
+               or sum(x[2].nbytes for x in self._items) > cfg.store_bytes):
+            self._items.pop(0)
+
+    def candidates(self, before: float) -> list[VisualFrame]:
+        if not math.isfinite(before):
+            raise ValueError("History cutoff must be finite")
+        return sorted((x[2] for x in self._items if x[2].timestamp < before),
+                      key=lambda frame: frame.timestamp)
+
+    def read(self, before: float) -> list[VisualFrame]:
+        cfg = self.config
+        eligible = [f for f in self.candidates(before) if f.token_count <= cfg.read_tokens]
+        selected = []
+        tokens = 0
+        preferred = uniform_indices(len(eligible), cfg.read_frames)
+        order = preferred + [i for i in range(len(eligible)) if i not in preferred]
+        for i in order:
+            if len(selected) >= cfg.read_frames:
+                break
+            frame = eligible[i]
+            if tokens + frame.token_count <= cfg.read_tokens:
+                selected.append(frame)
+                tokens += frame.token_count
+        return sorted(selected, key=lambda frame: frame.timestamp)
+
+    def stats(self):
+        return dict(seen=self._seen, stored_frames=len(self._items),
+                    stored_tokens=sum(x[2].token_count for x in self._items),
+                    stored_bytes=sum(x[2].nbytes for x in self._items),
+                    skipped_oversize=self._oversize)
+
+
+@dataclass
+class _ProgressiveRecord:
+    frame: VisualFrame
+    archived_at: float
+    stage: int = 1
+
+
+class ProgressiveVisualMemoryBank:
+    """Age cached frames through progressively coarser grids; drop oldest at caps.
+
+    A small heap schedules only the next compression of each nonsaturated frame.
+    Frames at one token require no further work. Dropped records never return.
+    """
+
+    def __init__(self, config: MemoryConfig, merge_size: int = 2):
+        if config.pool_stride < 2:
+            raise ValueError("Progressive pooling requires pool_stride >= 2")
+        self.config, self.merge_size = config, merge_size
+        self._records = OrderedDict()
+        self._due = []
+        self._clock = self._last_timestamp = -math.inf
+        self._seen = self._tokens = self._bytes = 0
+        self._dropped = self._oversize = self._operations = 0
+        self._pool_input_tokens = self._pool_output_tokens = 0
+
+    def _pool(self, frame):
+        pooled = pool_visual_frame(frame, self.config.pool_stride, self.merge_size)
+        self._operations += int(pooled.token_count < frame.token_count)
+        self._pool_input_tokens += frame.token_count
+        self._pool_output_tokens += pooled.token_count
+        return pooled
+
+    def _compact_heap(self):
+        if len(self._due) > 2 * len(self._records) + 64:
+            self._due = [(due, index) for due, index in self._due if index in self._records]
+            heapq.heapify(self._due)
+
+    def advance(self, now: float):
+        if not math.isfinite(now) or now < self._clock:
+            raise ValueError("Cannot move progressive memory time backwards")
+        self._clock = now
+        while self._due and self._due[0][0] <= now:
+            due, index = heapq.heappop(self._due)
+            record = self._records.get(index)
+            if record is None:
+                continue
+            old = record.frame
+            pooled = self._pool(old)
+            if pooled.token_count >= old.token_count:
+                raise RuntimeError("Scheduled progressive pooling must reduce tokens")
+            self._tokens += pooled.token_count - old.token_count
+            self._bytes += pooled.nbytes - old.nbytes
+            record.frame = pooled
+            record.stage += 1
+            if pooled.token_count > 1:
+                next_due = due + self.config.pool_age_seconds
+                if not math.isfinite(next_due) or next_due <= due:
+                    raise ValueError("Pooling interval cannot advance this timestamp")
+                heapq.heappush(self._due, (next_due, index))
+        self._compact_heap()
+
+    def observe(self, frame: VisualFrame, now: float):
+        if (not math.isfinite(frame.timestamp) or frame.timestamp <= self._last_timestamp
+                or frame.timestamp > now):
+            raise ValueError("Archived timestamps must increase and not exceed current time")
+        # Age existing evidence first; it may free enough budget to keep it.
+        self.advance(now)
+        pooled = self._pool(frame)
+        self._last_timestamp = frame.timestamp
+        self._seen += 1
+        cfg = self.config
+        if pooled.token_count > cfg.store_tokens or pooled.nbytes > cfg.store_bytes:
+            self._oversize += 1
+            return
+        if not cfg.capacity:
+            return
+        index = self._seen
+        self._records[index] = _ProgressiveRecord(pooled, now)
+        self._tokens += pooled.token_count
+        self._bytes += pooled.nbytes
+        if pooled.token_count > 1:
+            next_due = now + cfg.pool_age_seconds
+            if not math.isfinite(next_due) or next_due <= now:
+                raise ValueError("Pooling interval cannot advance this timestamp")
+            heapq.heappush(self._due, (next_due, index))
+        while (len(self._records) > cfg.capacity or self._tokens > cfg.store_tokens
+               or self._bytes > cfg.store_bytes):
+            _, oldest = self._records.popitem(last=False)
+            dropped = oldest.frame
+            self._tokens -= dropped.token_count
+            self._bytes -= dropped.nbytes
+            self._dropped += 1
+        self._compact_heap()
+
+    def candidates(self, before: float):
+        if not math.isfinite(before):
+            raise ValueError("History cutoff must be finite")
+        return [entry.frame for entry in self._records.values() if entry.frame.timestamp < before]
+
+    # Same fixed-budget reader; the storage policy is entirely different.
+    read = VisualMemoryBank.read
+
+    def stats(self):
+        return dict(seen=self._seen, stored_frames=len(self._records), stored_tokens=self._tokens,
+                    stored_bytes=self._bytes, skipped_oversize=self._oversize,
+                    dropped_oldest=self._dropped, pool_operations=self._operations,
+                    pool_input_tokens=self._pool_input_tokens, pool_output_tokens=self._pool_output_tokens,
+                    pending_pool_events=len(self._due))
+
+
+def _engine_lock(engine):
+    if not hasattr(engine, "_visual_memory_lock"):
+        engine._visual_memory_lock = threading.RLock()
+    return engine._visual_memory_lock
+
+
+@contextmanager
+def cached_image_features(engine, frames: list[VisualFrame]):
+    """Temporarily replace only this engine's native image-feature function.
+
+    Each record has a complete native or pooled carrier grid. Forward handles placeholder scatter,
+    DeepStack and mRoPE; no KV from another context is spliced into the decoder.
+    """
+    import torch
+
+    core = engine.model.model
+    config = engine.model.config
+    merge = config.vision_config.spatial_merge_size
+    layers = len(config.vision_config.deepstack_visual_indexes)
+    hidden = config.text_config.hidden_size
+    for frame in frames:
+        if (len(frame.grid_thw) != 3 or frame.grid_thw[0] != 1
+                or any(x <= 0 for x in frame.grid_thw)):
+            raise ValueError("Only complete image grids (t=1) are supported")
+        if frame.grid_thw[1] % merge or frame.grid_thw[2] % merge:
+            raise ValueError("Image grid is not divisible by spatial_merge_size")
+        expected = math.prod(frame.grid_thw) // merge**2
+        if tuple(frame.features.shape) != (expected, hidden):
+            raise ValueError("Cached final features do not match the image grid/hidden size")
+        if len(frame.deepstack) != layers:
+            raise ValueError("Cached DeepStack layer count does not match this model")
+        if any(tuple(x.shape) != (expected, hidden) for x in frame.deepstack):
+            raise ValueError("Cached DeepStack shape does not match the final features")
+    expected_grid = torch.tensor([f.grid_thw for f in frames], dtype=torch.long)
+    state = {"calls": 0}
+
+    def get_cached(pixel_values, image_grid_thw=None):
+        if image_grid_thw is None or not torch.equal(image_grid_thw.detach().cpu(), expected_grid):
+            raise ValueError("Readout image grids/order differ from the cached evidence")
+        state["calls"] += 1
+        if state["calls"] != 1:
+            raise RuntimeError("Only one image prefill per cached readout is supported")
+        return (tuple(f.features.to(engine.device) for f in frames),
+                [torch.cat([f.deepstack[layer].to(engine.device) for f in frames], dim=0)
+                 for layer in range(layers)])
+
+    sentinel = object()
+    with _engine_lock(engine):
+        previous = core.__dict__.get("get_image_features", sentinel)
+        core.get_image_features = get_cached
+        try:
+            yield state
+        finally:
+            if previous is sentinel:
+                delattr(core, "get_image_features")
+            else:
+                core.get_image_features = previous
+
+
+class NativeFeatureAdapter:
+    """Thin adapter for the exact Qwen3-VL interface used by OneStreamer."""
+
+    def __init__(self, engine):
+        import transformers
+
+        if transformers.__version__ != "4.57.6":
+            raise RuntimeError("This native-feature adapter requires transformers==4.57.6")
+        if engine.model.config.model_type != "qwen3_vl":
+            raise ValueError("V0 supports Qwen3-VL only; other backbones need an adapter")
+        self.engine = engine
+
+    def encode(self, frames, max_pixels=None, store_on_cpu=True) -> list[VisualFrame]:
+        import torch
+
+        if not frames:
+            return []
+        engine = self.engine
+        images = [image if max_pixels is not None else engine._pad_to_patch_grid(image)
+                  for _, image in frames]
+        options = dict(images=images, return_tensors="pt", do_resize=max_pixels is not None)
+        if max_pixels is not None:
+            options.update(min_pixels=1024, max_pixels=max_pixels)
+        pixels = engine.processor.image_processor(**options)
+        grid = pixels["image_grid_thw"]
+        with _engine_lock(engine), torch.inference_mode():
+            final, deepstack = engine.model.model.get_image_features(
+                pixels["pixel_values"].to(device=engine.device, dtype=engine.model.dtype),
+                image_grid_thw=grid.to(engine.device))
+        patch = engine.processor.image_processor.patch_size
+        def retain(tensor):
+            tensor = tensor.detach()
+            # History owns independent CPU storage. Recent query features can
+            # stay on the accelerator, avoiding a needless device round trip.
+            return tensor.to("cpu", copy=True) if store_on_cpu else tensor
+        result = []
+        offset = 0
+        for (timestamp, source_image), feature, shape in zip(frames, final, grid.tolist()):
+            length = feature.shape[0]
+            result.append(VisualFrame(float(timestamp), tuple(shape),
+                                     retain(feature),
+                                     tuple(retain(x[offset:offset + length])
+                                           for x in deepstack),
+                                     (shape[2] * patch, shape[1] * patch),
+                                     source_size=tuple(source_image.size)))
+            offset += length
+        if len(result) != len(frames) or any(x.shape[0] != offset for x in deepstack):
+            raise RuntimeError("Native encoder returned inconsistent image/DeepStack lengths")
+        return result
+
+    def prepare_inputs(self, chat, frames):
+        """Use the native processor for token expansion; dummy pixels never enter ViT."""
+        import torch
+        from PIL import Image
+
+        engine = self.engine
+        images = [Image.new("RGB", frame.size) for frame in frames]
+        prompt = engine.processor.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+        inputs = engine.processor(text=[prompt], images=images, padding=True,
+                                  do_resize=False, truncation=False, return_tensors="pt")
+        expected_grid = torch.tensor([f.grid_thw for f in frames], dtype=torch.long)
+        if not torch.equal(inputs["image_grid_thw"].cpu(), expected_grid):
+            raise ValueError("Processor changed the cached image grid")
+        visual_id = engine.model.config.image_token_id
+        count = int((inputs["input_ids"] == visual_id).sum().item())
+        if count != sum(f.token_count for f in frames):
+            raise ValueError("Image placeholder count does not match cached visual tokens")
+        if inputs["input_ids"].shape[0] != 1 or "pixel_values_videos" in inputs:
+            raise ValueError("Only single-sample image-based QA is supported")
+        # generate has expand_size=1. In this exact HF version the image branch
+        # only checks pixel_values is not None before calling our validated hook.
+        # Avoid copying the dummy processed image patches to the accelerator.
+        inputs.pop("pixel_values")
+        inputs = inputs.to(engine.device)
+        inputs["pixel_values"] = torch.empty(0, device=engine.device, dtype=engine.model.dtype)
+        metrics = dict(input_tokens=int(inputs["input_ids"].shape[-1]), visual_tokens=count,
+                       text_tokens=int(inputs["input_ids"].shape[-1]) - count,
+                       image_grid_thw=expected_grid.tolist(),
+                       input_image_sizes=[list(f.size) for f in frames])
+        return inputs, metrics
+
+    def build_chat(self, history, recent, question, direct=False):
+        frames = list(history) + list(recent)
+        if not recent or any(a.timestamp >= b.timestamp for a, b in zip(frames, frames[1:])):
+            raise ValueError("History/recent evidence must be nonempty, distinct and chronological")
+        system = ("Answer the question using only the supplied timestamped visual evidence. "
+                  "HISTORICAL_VISUAL_MEMORY contains sparse earlier observations; "
+                  "RECENT_VISUAL_CONTEXT contains the recent scene. Missing historical "
+                  "frames do not prove an event never happened. Respect timestamps and "
+                  "distinguish earlier states from the current state. "
+                  + ("Follow the requested answer format exactly." if direct else
+                     "Output only the uppercase letter of the correct option."))
+        content = []
+        for tag, items in (("HISTORICAL_VISUAL_MEMORY", history), ("RECENT_VISUAL_CONTEXT", recent)):
+            content.append(dict(type="text", text=f"<{tag}>"))
+            if not items:
+                content.append(dict(type="text", text="No additional historical visual evidence."))
+            for frame in items:
+                content.extend([dict(type="text", text=f"<{frame.timestamp:.3f}s>"),
+                                dict(type="image")])
+            content.append(dict(type="text", text=f"</{tag}>"))
+        content.append(dict(type="text", text=question))
+        return [dict(role="system", content=[dict(type="text", text=system)]),
+                dict(role="user", content=content)]
+
+    def context_limit(self, context_tokens=None):
+        model_limit = int(self.engine.model.config.text_config.max_position_embeddings)
+        if model_limit <= 0:
+            raise ValueError("Model must declare a positive max_position_embeddings")
+        if context_tokens is not None and (
+                not isinstance(context_tokens, int) or isinstance(context_tokens, bool)
+                or context_tokens <= 0):
+            raise ValueError("context_tokens must be a positive integer")
+        return min(model_limit, context_tokens if context_tokens is not None else DEFAULT_CONTEXT_TOKENS)
+
+    def count_input_tokens(self, history, recent, question, direct=False):
+        """Exact expanded length, without preprocessing images or running ViT."""
+        frames = list(history) + list(recent)
+        processor = self.engine.processor
+        prompt = processor.apply_chat_template(
+            self.build_chat(history, recent, question, direct),
+            add_generation_prompt=True, tokenize=False)
+        # Using the processor also preserves its text kwargs/defaults. Without
+        # images each atomic image marker remains a single token at this stage.
+        raw = processor(text=[prompt], images=None, padding=True, truncation=False,
+                        return_tensors="pt")
+        ids = raw["input_ids"]
+        image_count = int((ids == self.engine.model.config.image_token_id).sum().item())
+        if ids.shape[0] != 1 or image_count != len(frames):
+            raise ValueError("Expected exactly one unexpanded image marker per cached frame")
+        return int(ids.shape[-1]) + sum(f.token_count - 1 for f in frames)
+
+    def select_history(self, candidates, recent, question, direct=False, max_tokens=16,
+                       context_tokens=None):
+        """Greedily fill the remaining context with whole stored image bundles.
+
+        Try temporally spread candidates first, continuing past images that do
+        not fit. Count timestamp/wrapper/question tokens as well as visual ones.
+        No stored evidence is re-encoded or recompressed at question time.
+        """
+        limit = self.context_limit(context_tokens)
+        if max_tokens <= 0 or max_tokens >= limit:
+            raise ValueError("Answer reserve must be positive and smaller than context limit")
+        base = self.count_input_tokens([], recent, question, direct)
+        input_limit = limit - max_tokens
+        if base > input_limit:
+            raise ValueError(f"Recent context/question needs {base} input tokens plus {max_tokens} "
+                             f"answer tokens, exceeding context limit {limit}; increase the cap")
+        candidates = sorted(candidates, key=lambda frame: frame.timestamp)
+        # Validates causality, uniqueness and recent order even for images that
+        # will eventually be rejected for their size.
+        self.build_chat(candidates, recent, question, direct)
+        order, seen = [], set()
+        count = min(2, len(candidates))
+        while count:
+            for index in uniform_indices(len(candidates), count):
+                if index not in seen:
+                    order.append(index)
+                    seen.add(index)
+            if count == len(candidates):
+                break
+            count = min(count * 2, len(candidates))
+        selected, used = [], base
+        count_calls = 1  # Includes the recent-only baseline above.
+
+        def measure(items):
+            nonlocal count_calls
+            count_calls += 1
+            return self.count_input_tokens(items, recent, question, direct)
+
+        # Large progressive banks can contain thousands of one-token records.
+        # Avoid retokenizing a growing full prompt once per stored frame.
+        tail = order
+        tail_skipped = 0
+        if len(order) > 128:
+            all_cost = measure(candidates)
+            if all_cost <= input_limit:
+                selected, used, tail = candidates, all_cost, []
+            else:
+                recent_visual = sum(f.token_count for f in recent)
+                viable = [index for index in order
+                          if recent_visual + candidates[index].token_count <= input_limit
+                          and measure([candidates[index]]) <= input_limit]
+                low, high = 0, len(viable)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    trial = sorted((candidates[i] for i in viable[:middle]), key=lambda f: f.timestamp)
+                    cost = measure(trial)
+                    if cost <= input_limit:
+                        low = middle
+                        selected, used = trial, cost
+                    else:
+                        high = middle - 1
+                tail = viable[low:low + 128]
+                tail_skipped = max(0, len(viable) - low - len(tail))
+        for index in tail:
+            trial = sorted([*selected, candidates[index]], key=lambda frame: frame.timestamp)
+            cost = measure(trial)
+            if cost <= input_limit:
+                selected, used = trial, cost
+        return selected, dict(context_limit=limit, answer_reserve_tokens=max_tokens,
+                              recent_only_input_tokens=base, selected_input_tokens=used,
+                              history_extra_input_tokens=used - base,
+                              remaining_input_tokens=input_limit - used,
+                              eligible_history_frames=len(candidates),
+                              budget_count_calls=count_calls,
+                              tail_candidates_skipped=tail_skipped)
+
+    def answer(self, history, recent, question, direct=False, max_tokens=16, context_tokens=None):
+        import torch
+
+        frames = list(history) + list(recent)
+        limit = self.context_limit(context_tokens)
+        expected = self.count_input_tokens(history, recent, question, direct)
+        if max_tokens <= 0 or expected + max_tokens > limit:
+            raise ValueError(f"Input ({expected}) plus answer reserve ({max_tokens}) "
+                             f"exceeds context limit {limit}")
+        chat = self.build_chat(history, recent, question, direct)
+        inputs, metrics = self.prepare_inputs(chat, frames)
+        if metrics["input_tokens"] != expected or metrics["input_tokens"] + max_tokens > limit:
+            raise RuntimeError("Native processor length differs from the validated context budget")
+        metrics.update(context_limit=limit, answer_reserve_tokens=max_tokens,
+                       remaining_context_tokens=limit - metrics["input_tokens"] - max_tokens)
+        tokenizer = self.engine.processor.tokenizer
+        pad = tokenizer.pad_token_id
+        with cached_image_features(self.engine, frames) as state, torch.inference_mode():
+            output = self.engine.model.generate(
+                **inputs, max_new_tokens=max_tokens, do_sample=False, use_cache=True,
+                num_beams=1, num_return_sequences=1, temperature=1.0, top_p=1.0, top_k=0,
+                pad_token_id=tokenizer.eos_token_id if pad is None else pad)
+        if state["calls"] != 1:
+            raise RuntimeError("Native cached features were not consumed exactly once")
+        text = self.engine.processor.batch_decode(
+            output[:, inputs["input_ids"].shape[-1]:], skip_special_tokens=False)[0]
+        return self.engine._strip_end_tokens(text), metrics
+
+
+class StreamSampler:
+    """Persistent decoder with a fixed origin; never prefetches beyond a cutoff."""
+
+    def __init__(self, path, start, fps):
+        import cv2
+
+        self._cv2 = cv2
+        self.capture = cv2.VideoCapture(str(path))
+        if not self.capture.isOpened():
+            self.capture.release()
+            raise ValueError(f"Cannot open video: {path}")
+        self.source_fps = float(self.capture.get(cv2.CAP_PROP_FPS))
+        self.total_frames = int(self.capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        if not math.isfinite(self.source_fps) or self.source_fps <= 0 or self.total_frames <= 0:
+            self.close()
+            raise ValueError(f"Invalid video metadata: {path}")
+        if start < 0 or not math.isfinite(start) or fps <= 0 or not math.isfinite(fps):
+            self.close()
+            raise ValueError("Invalid stream start/fps")
+        self.origin, self.fps = start, fps
+        self.observation_time = start
+        self.slot, self.last_sample = 0, -1
+        self.current = math.floor(start * self.source_fps)
+        if self.current >= self.total_frames:
+            self.close()
+            raise ValueError("Stream start lies outside the video")
+        self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.current)
+        self.cutoff = start
+
+    def advance(self, end):
+        from PIL import Image
+
+        if not math.isfinite(end) or end < self.cutoff:
+            raise ValueError("Cannot move a stream cutoff backwards")
+        self.cutoff = end
+        while self.origin + self.slot / self.fps < min(end, self.total_frames / self.source_fps):
+            scheduled = self.origin + self.slot / self.fps
+            index = math.floor(scheduled * self.source_fps)
+            self.slot += 1
+            if index == self.last_sample:
+                continue
+            frame = None
+            while self.current <= index:
+                ok, frame = self.capture.read()
+                if not ok:
+                    raise RuntimeError(f"Failed to decode source frame {self.current}")
+                self.current += 1
+            if frame is None:
+                raise RuntimeError("Sampling cursor moved behind the decoder")
+            self.last_sample = index
+            # Availability is the fixed sampling time, which may be later than
+            # the source-frame timestamp after floor-to-frame quantization.
+            self.observation_time = scheduled
+            yield index / self.source_fps, Image.fromarray(
+                self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB))
+
+    def close(self):
+        self.capture.release()
+
+
+def _ensure_paths():
+    here = Path(__file__).resolve()
+    for directory in (here.parents[1], here.parents[3]):
+        if str(directory) not in sys.path:
+            sys.path.insert(0, str(directory))
+
+
+def _sync(engine):
+    import torch
+
+    device = torch.device(engine.device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def infer(job, rows, config=None, engine=None):
+    """Independent runner for official OVO/StreamingBench sample dictionaries."""
+    _ensure_paths()
+    from onestreamer.engine import OneStreamerEngine
+    from onestreamer.ovobench import build_question_text, score_prediction
+    from onestreamer.schema import Sample
+    from onestreamer.video import read_recent_frames
+
+    config = config or MemoryConfig()
+    engine = engine or OneStreamerEngine(
+        model_path=job["model_path"], dtype=job.get("dtype", "bfloat16"),
+        device=job.get("device", "cuda"),
+        attn_implementation=job.get("attn_implementation", "flash_attention_2"))
+    adapter = NativeFeatureAdapter(engine)
+    groups = {}
+    for row in rows:
+        sample = Sample.from_dict(row)
+        path = Path(row.get("media") or (Path(job["video_root"]) / sample.video)).resolve()
+        groups.setdefault((str(path), sample.start), []).append((sample, row))
+    for (path, origin), items in sorted(groups.items()):
+        progressive = config.history_compression == "progressive_pool"
+        bank = (ProgressiveVisualMemoryBank(config, engine.model.config.vision_config.spatial_merge_size)
+                if progressive else VisualMemoryBank(config))
+        pooled_stream = config.history_compression in {"avg_pool", "progressive_pool"}
+        window = RecentFeatureWindow(capacity=config.recent_frames) if pooled_stream else None
+        # The pooling-mode recent-only control uses the identical causal stream
+        # and full-resolution FIFO, even when historical storage is disabled.
+        sampler = StreamSampler(path, origin, config.history_fps) if config.enabled or pooled_stream else None
+        observation_total = 0.0
+        encoded_frames = 0
+        pooled_input_tokens = pooled_output_tokens = 0
+        try:
+            for sample, row in sorted(items, key=lambda item: (item[0].end, item[0].sample_id)):
+                _sync(engine)
+                start = time.perf_counter()
+                if sampler is not None:
+                    for frame in sampler.advance(sample.end):
+                        if progressive and config.enabled:
+                            bank.advance(sampler.observation_time)
+                        if pooled_stream:
+                            native = adapter.encode([frame], store_on_cpu=False)[0]
+                            retired = window.observe(native)
+                            if retired is not None and config.enabled:
+                                if progressive:
+                                    bank.observe(retired, now=sampler.observation_time)
+                                else:
+                                    compressed = pool_visual_frame(
+                                        retired, stride=config.pool_stride,
+                                        merge_size=engine.model.config.vision_config.spatial_merge_size)
+                                    pooled_input_tokens += retired.token_count
+                                    pooled_output_tokens += compressed.token_count
+                                    bank.observe(compressed)
+                                    del compressed
+                            # Do not keep an evicted full-resolution GPU tensor
+                            # alive until the next query/observation.
+                            del retired, native
+                        else:
+                            bank.observe(adapter.encode([frame], max_pixels=config.history_max_pixels)[0])
+                        encoded_frames += 1
+                if progressive and config.enabled:
+                    bank.advance(sample.end)
+                    progressive_stats = bank.stats()
+                    pooled_input_tokens = progressive_stats["pool_input_tokens"]
+                    pooled_output_tokens = progressive_stats["pool_output_tokens"]
+                _sync(engine)
+                observation_delta = time.perf_counter() - start
+                observation_total += observation_delta
+                start = time.perf_counter()
+                if pooled_stream:
+                    recent = window.frames()
+                    recent_sizes = [list(f.source_size or f.size) for f in recent]
+                else:
+                    # Legacy branch retains exact official end-aligned pixels.
+                    recent_pixels = read_recent_frames(path, sample.start, sample.end, config.recent_frames, 1.0)
+                    recent = adapter.encode(recent_pixels, store_on_cpu=False)
+                    recent_sizes = [list(image.size) for _, image in recent_pixels]
+                if not recent:
+                    raise ValueError("No sampled recent frame is available at this cutoff")
+                question = build_question_text(sample)
+                direct = sample.eval_mode != "mcq_letter"
+                selection_meta = {}
+                if config.read_mode == "fill":
+                    history, selection_meta = adapter.select_history(
+                        bank.candidates(before=recent[0].timestamp), recent, question,
+                        direct=direct, max_tokens=16, context_tokens=config.context_tokens)
+                else:
+                    history = bank.read(before=recent[0].timestamp)
+                if any(f.timestamp >= sample.end for f in history):
+                    raise RuntimeError("Future visual evidence entered the readout")
+                _sync(engine)
+                preparation_seconds = time.perf_counter() - start
+                qa_start = time.perf_counter()
+                prediction, metrics = adapter.answer(
+                    history, recent, question, direct=direct, max_tokens=16,
+                    context_tokens=config.context_tokens)
+                _sync(engine)
+                qa_seconds = time.perf_counter() - qa_start
+                parsed, hit = score_prediction(sample, prediction)
+                yield dict(row, model_alias=job.get("model", Path(job["model_path"]).name),
+                           variant=(f"{VERSION}_{config.history_compression}_{config.read_mode}_r{config.recent_frames}"
+                                    + (f"_recent{config.recent_frames}_control" if not config.enabled else "")),
+                           prediction=prediction, parsed_output=parsed, hit=hit,
+                           memory_text="", memory_meta={"memory_tokens": 0}, caption_cache=None,
+                           caption_counts={}, history_timestamps=[f.timestamp for f in history],
+                           history_visual_tokens=sum(f.token_count for f in history),
+                           history_pool_scales=[f.pool_scale for f in history],
+                           history_frame_tokens=[f.token_count for f in history],
+                           history_read_frames=len(history), bank=bank.stats(),
+                           history_selection_meta=selection_meta,
+                           recent_timestamps=[f.timestamp for f in recent],
+                           recent_frames=config.recent_frames, recent_read_frames=len(recent),
+                           recent_image_sizes=recent_sizes,
+                           recent_sampling=("fixed_origin_fifo" if pooled_stream else "official_end_aligned"),
+                           stream_encoded_frames_cumulative=encoded_frames,
+                           pooled_input_tokens_cumulative=pooled_input_tokens,
+                           pooled_output_tokens_cumulative=pooled_output_tokens,
+                           observation_seconds_delta=observation_delta,
+                           observation_seconds_cumulative=observation_total,
+                           recent_preparation_seconds=preparation_seconds,
+                           qa_seconds=qa_seconds,
+                           runtime_seconds=preparation_seconds + qa_seconds,
+                           total_runtime_seconds=observation_delta + preparation_seconds + qa_seconds,
+                           **metrics)
+                # A suspended generator may retain the current query's tensors;
+                # release these references before advancing the next query.
+                del recent, history
+        finally:
+            if sampler is not None:
+                sampler.close()
+
+
+def _load_rows(path):
+    raw = path.read_text(encoding="utf-8")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return [json.loads(line) for line in raw.splitlines() if line.strip()], {}
+    if isinstance(value, list):
+        return value, {}
+    if isinstance(value, dict) and "samples" in value:
+        return value["samples"], value
+    if isinstance(value, dict) and "sample_id" in value:
+        return [value], {}
+    raise ValueError("Expected a sample list, sample JSONL, or manifest containing samples")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--manifest", type=Path)
+    source.add_argument("--samples", type=Path)
+    parser.add_argument("--model-path")
+    parser.add_argument("--video-root", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--subtasks", nargs="+", help="Exact official subtask labels, e.g. EPM ASI")
+    parser.add_argument("--recent-frames", type=int, default=16,
+                        help="Full-feature recent window size; historical pooling starts only upon FIFO eviction")
+    parser.add_argument("--history-capacity", type=int,
+                        help="Frame cap; defaults to token cap for progressive_pool, otherwise 64; 0 disables history")
+    parser.add_argument("--history-store-tokens", type=int, default=16384)
+    parser.add_argument("--history-store-mib", type=float, default=512)
+    parser.add_argument("--history-read-frames", type=int, default=4)
+    parser.add_argument("--history-read-tokens", type=int, default=1024)
+    parser.add_argument("--history-read-mode", choices=("fixed", "fill"), default="fixed",
+                        help="fill uses remaining context, ignoring fixed history read caps")
+    parser.add_argument("--context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
+                        help="Total context cap including answer reserve; default: 32768 (32K)")
+    parser.add_argument("--history-fps", type=float, default=1.0)
+    parser.add_argument("--history-max-pixels", type=int, default=262144)
+    parser.add_argument("--history-compression", choices=("resize", "avg_pool", "progressive_pool"), default="resize",
+                        help="progressive_pool repeatedly compresses aged frames; avg_pool compresses once on FIFO eviction")
+    parser.add_argument("--history-pool-stride", type=int, default=2,
+                        help="Spatial pooling stride per axis; 2 gives about 4x fewer historical tokens")
+    parser.add_argument("--history-pool-age-seconds", type=float, default=60.0,
+                        help="Video seconds after FIFO eviction between progressive pooling steps")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--attn-implementation", choices=("flash_attention_2", "sdpa", "eager"),
+                        default="flash_attention_2")
+    parser.add_argument("--dry-run", action="store_true", help="Validate inputs without loading the model")
+    args = parser.parse_args(argv)
+    _ensure_paths()
+    from onestreamer.schema import Sample
+
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit must be positive")
+    if not math.isfinite(args.history_store_mib) or args.history_store_mib < 0:
+        parser.error("--history-store-mib must be finite and nonnegative")
+    capacity = args.history_capacity
+    if capacity is None:
+        capacity = args.history_store_tokens if args.history_compression == "progressive_pool" else 64
+    config = MemoryConfig(
+        capacity=capacity, store_tokens=args.history_store_tokens,
+        store_bytes=int(args.history_store_mib * 1024**2), read_frames=args.history_read_frames,
+        read_tokens=args.history_read_tokens, history_fps=args.history_fps,
+        history_max_pixels=args.history_max_pixels, seed=args.seed,
+        read_mode=args.history_read_mode, context_tokens=args.context_tokens,
+        history_compression=args.history_compression, pool_stride=args.history_pool_stride,
+        pool_age_seconds=args.history_pool_age_seconds, recent_frames=args.recent_frames)
+    rows, original = _load_rows(args.manifest or args.samples)
+    model_path = args.model_path or original.get("model_path")
+    if not model_path:
+        parser.error("--model-path is required when it is absent from the input manifest")
+    ids = [Sample.from_dict(row).sample_id for row in rows]
+    if len(set(ids)) != len(ids):
+        parser.error("Duplicate sample IDs")
+    if args.subtasks:
+        unknown = set(args.subtasks) - {row.get("subtask", "") for row in rows}
+        if unknown:
+            parser.error(f"Unknown subtasks: {sorted(unknown)}")
+        rows = [row for row in rows if row.get("subtask") in args.subtasks]
+    rows = rows[:args.limit] if args.limit is not None else rows
+    if not rows:
+        parser.error("No samples selected")
+    for row in rows:
+        sample = Sample.from_dict(row)
+        # Persist schema defaults too (e.g. an omitted start means 0.0).
+        row.update(asdict(sample))
+        if not math.isfinite(sample.start) or not math.isfinite(sample.end) or sample.start < 0:
+            parser.error(f"Invalid stream bounds: {sample.sample_id}")
+        if args.video_root is not None:
+            path = args.video_root / sample.video
+        elif row.get("media"):
+            path = Path(row["media"])
+        elif original.get("video_root"):
+            path = Path(original["video_root"]) / sample.video
+        else:
+            parser.error("--video-root is required when input samples have no media path")
+        if not path.is_file():
+            parser.error(f"Video does not exist: {path}")
+        row["media"] = str(path.resolve())
+    job = dict(model=original.get("model", Path(model_path).name), model_path=model_path,
+               device=args.device, dtype=args.dtype, attn_implementation=args.attn_implementation,
+               video_root=str(args.video_root or original.get("video_root", ".")))
+    pooled_stream = config.history_compression in {"avg_pool", "progressive_pool"}
+    progressive = config.history_compression == "progressive_pool"
+    manifest = dict(version=VERSION, config=asdict(config), job=job, samples=rows,
+                    source_manifest=str((args.manifest or args.samples).resolve()),
+                    protocol=dict(recent_frames=config.recent_frames, recent_fps=1.0, answer_tokens=16,
+                                  caption_generation=False, history_sampling="fixed_origin_causal",
+                                  history_storage=("pooled_native_features_with_deepstack" if pooled_stream
+                                                   else "native_full_image_features_with_deepstack"),
+                                  history_write=("on_recent_fifo_eviction_then_age_pool" if progressive else
+                                                 "on_recent_fifo_eviction" if pooled_stream
+                                                 else "on_observation"),
+                                  history_selection=("age_pool_then_drop_oldest_at_caps" if progressive
+                                                     else "seeded_priority_reservoir"),
+                                  read_selection=("temporal_spread_context_fill" if config.read_mode == "fill"
+                                                  else "uniform_temporal"),
+                                  recent_replay=("fixed_origin_fifo_cached_features" if pooled_stream
+                                                 else "official_decoder"),
+                                  recent_prompt="visual_memory_v0_common_control",
+                                  runtime_seconds=("cached_recent_readout_plus_qa" if pooled_stream
+                                                   else "recent_decode_encode_readout_plus_qa"),
+                                  storage_bytes="tensor_payload_including_deepstack"))
+    fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    manifest["fingerprint"] = fingerprint
+    if args.dry_run:
+        print(json.dumps(dict(samples=len(rows), streams=len({(r['media'], r['start']) for r in rows}),
+                              model_path=model_path, config=asdict(config), fingerprint=fingerprint), indent=2))
+        return
+    if args.output.exists() and any(args.output.iterdir()):
+        parser.error("Output directory must be empty; v0 does not resume or overwrite predictions")
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    started = time.perf_counter()
+    results = []
+    with (args.output / "predictions.jsonl").open("x", encoding="utf-8") as handle:
+        for row in infer(job, rows, config):
+            row.update(status="ok", fingerprint=fingerprint)
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.flush()
+            results.append(row)
+            print(f"finished {row['sample_id']} hit={row['hit']} history_tokens={row['history_visual_tokens']}", flush=True)
+    from onestreamer.metrics import aggregate
+    summary = aggregate(results)
+    summary.update(wall_seconds_including_model_load=time.perf_counter() - started,
+                   observation_seconds=sum(r["observation_seconds_delta"] for r in results),
+                   query_seconds=sum(r["runtime_seconds"] for r in results),
+                   total_measured_seconds=sum(r["total_runtime_seconds"] for r in results))
+    (args.output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+# Local Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+# Local credentials and inference artifacts
+.env
+.env.*
+!.env.example
+**/outputs/
+**/judge_outputs/
+/results/
+/path_to/
+/Eval/path_to/
+/models/
+/checkpoints/

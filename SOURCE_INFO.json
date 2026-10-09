@@ -1,0 +1,16 @@
+{
+  "created": "2026-10-09",
+  "upstream": "https://github.com/MCG-NJU/OneStreamer.git",
+  "base_commit": "24ffb1093570d02a76eac5fdf59aff6a763e7481",
+  "prototype_version": "visual_memory_v4_configurable_recent",
+  "tracked_files": 843,
+  "local_additions": [
+    "Eval/Proactive_Eval/OneStreamer/src/onestreamer/visual_memory.py",
+    "Eval/Proactive_Eval/OneStreamer/VISUAL_MEMORY.md",
+    "Eval/Proactive_Eval/OneStreamer/tests/test_visual_memory.py",
+    "Eval/Proactive_Eval/OneStreamer/tests/test_native_feature_adapter.py"
+  ],
+  "weights_included": false,
+  "full_benchmark_videos_included": false,
+  "purpose": "Frozen OneStreamer inference with progressive visual-feature memory"
+}
