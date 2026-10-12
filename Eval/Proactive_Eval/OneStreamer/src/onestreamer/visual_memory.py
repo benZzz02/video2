@@ -21,9 +21,13 @@ resize mode instead encodes lower-resolution historical images and replays the
 official recent-frame decoder. resize/avg_pool use a seeded reservoir; readout
 uses fixed-budget temporal selection, or --history-read-mode fill to use the
 remaining context after the configured recent window, question/formatting and answer reservation.
+--history-read-mode state first probes the recent window using native readiness
+tokens, then exposes nested visual history only while the model reports
+insufficient evidence. --state-history-budgets sets the increasing historical
+visual-token caps. State decisions never enter the final answer or memory bank.
 --context-tokens sets a total cap (default 32768), bounded by the model config.
-These are baselines, not a novel compression or query-aware retrieval algorithm.
-The memory policy is model independent;
+The historical writer and temporal frame ordering are model independent;
+the optional state readout policy depends on the frozen checkpoint's decisions.
 the feature adapter is deliberately limited to Qwen3-VL/Transformers 4.57.6.
 
 Frames are observed causally from the evaluated stream start; discarded evidence
@@ -52,8 +56,25 @@ import time
 from typing import Any
 
 
-VERSION = "visual_memory_v4_configurable_recent"
+VERSION = "visual_memory_v5_state_readout"
 DEFAULT_CONTEXT_TOKENS = 32768
+STATE_TOKENS = ("</Response>", "</Standby>", "</Silence>")
+STATE_PROMPT_VERSION = "native_readiness_v2"
+STATE_SYSTEM_PROMPT = (
+    "Decide whether the supplied timestamped visual evidence is sufficient to answer the user's question. "
+    "HISTORICAL_VISUAL_MEMORY contains sparse earlier observations; RECENT_VISUAL_CONTEXT contains "
+    "the recent scene. Respect timestamps and distinguish earlier states from the current state. "
+    "Judge the evidence needed by this particular question. A question about the current scene can "
+    "be answerable from recent observations alone. A question about earlier events may require "
+    "earlier observations. A prediction asks for an inference from observed evidence, not for "
+    "observation of future frames. A supported negative answer or zero count is still an answer. "
+    "Missing historical frames alone do not establish that an event never happened. "
+    "Output exactly one native state token: </Response> if the available information is sufficient "
+    "to answer; </Standby> if relevant evidence is present but incomplete; </Silence> if the supplied "
+    "observations contain no relevant evidence. Output only that token. Do not answer the question, "
+    "describe the scene, or generate a caption. The question's answer-format instructions apply "
+    "to the subsequent answer, not to this state decision."
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +93,7 @@ class MemoryConfig:
     pool_stride: int = 2
     pool_age_seconds: float = 60.0
     recent_frames: int = 16
+    state_history_budgets: tuple[int, ...] = (1024, 4096, 16384)
 
     def __post_init__(self):
         for name in ("capacity", "store_tokens", "store_bytes", "read_frames", "read_tokens"):
@@ -82,8 +104,12 @@ class MemoryConfig:
             raise ValueError("history_fps must be finite and positive")
         if self.history_max_pixels < 1024:
             raise ValueError("history_max_pixels must be at least 1024")
-        if self.read_mode not in {"fixed", "fill"}:
-            raise ValueError("read_mode must be fixed or fill")
+        if self.read_mode not in {"fixed", "fill", "state"}:
+            raise ValueError("read_mode must be fixed, fill or state")
+        budgets = self.state_history_budgets
+        if (not budgets or any(not isinstance(x, int) or isinstance(x, bool) or x <= 0 for x in budgets)
+                or any(a >= b for a, b in zip(budgets, budgets[1:]))):
+            raise ValueError("state_history_budgets must be strictly increasing positive integers")
         if self.context_tokens is not None and (
                 not isinstance(self.context_tokens, int) or isinstance(self.context_tokens, bool)
                 or self.context_tokens <= 0):
@@ -105,7 +131,7 @@ class MemoryConfig:
     @property
     def enabled(self):
         return all((self.capacity, self.store_tokens, self.store_bytes)) and (
-            self.read_mode == "fill" or all((self.read_frames, self.read_tokens)))
+            self.read_mode in {"fill", "state"} or all((self.read_frames, self.read_tokens)))
 
 
 @dataclass(frozen=True)
@@ -577,10 +603,13 @@ class NativeFeatureAdapter:
 
     def count_input_tokens(self, history, recent, question, direct=False):
         """Exact expanded length, without preprocessing images or running ViT."""
-        frames = list(history) + list(recent)
+        return self._count_chat_tokens(self.build_chat(history, recent, question, direct),
+                                       list(history) + list(recent))
+
+    def _count_chat_tokens(self, chat, frames):
         processor = self.engine.processor
         prompt = processor.apply_chat_template(
-            self.build_chat(history, recent, question, direct),
+            chat,
             add_generation_prompt=True, tokenize=False)
         # Using the processor also preserves its text kwargs/defaults. Without
         # images each atomic image marker remains a single token at this stage.
@@ -591,6 +620,83 @@ class NativeFeatureAdapter:
         if ids.shape[0] != 1 or image_count != len(frames):
             raise ValueError("Expected exactly one unexpanded image marker per cached frame")
         return int(ids.shape[-1]) + sum(f.token_count - 1 for f in frames)
+
+    def build_state_chat(self, history, recent, question, direct=False):
+        # Preserve the exact visual blocks and question. State decisions never
+        # become captions, memory records, or context for the final answer.
+        chat = self.build_chat(history, recent, question, direct)
+        chat[0]["content"] = [dict(type="text", text=STATE_SYSTEM_PROMPT)]
+        # The evaluation question can itself end with "Best option:(" or
+        # "answer only Yes/No". Quote it as the task being assessed and put
+        # the current state request last, without altering the answer prompt.
+        chat[1]["content"][-1] = dict(type="text", text=(
+            "<QUESTION_TO_ASSESS>\n" + question + "\n</QUESTION_TO_ASSESS>\n"
+            "Do not answer the quoted question yet. Its letter, Yes/No, or number format applies "
+            "only when an answer is requested later. For this turn, assess whether the visual "
+            "evidence already supplied is enough to answer it. Emit exactly one state token: "
+            "</Response> for sufficient evidence, </Standby> for relevant but incomplete evidence, "
+            "or </Silence> for no relevant evidence. State token:"
+        ))
+        return chat
+
+    def count_state_input_tokens(self, history, recent, question, direct=False):
+        return self._count_chat_tokens(self.build_state_chat(history, recent, question, direct),
+                                       list(history) + list(recent))
+
+    def state_token_ids(self):
+        tokenizer = self.engine.processor.tokenizer
+        ids = {}
+        for state in STATE_TOKENS:
+            encoded = tokenizer.encode(state, add_special_tokens=False)
+            token_id = tokenizer.convert_tokens_to_ids(state)
+            if (len(encoded) != 1 or encoded[0] != token_id
+                    or token_id == tokenizer.unk_token_id
+                    or token_id not in tokenizer.all_special_ids):
+                raise ValueError(f"Checkpoint lacks atomic native special state token {state}")
+            ids[state] = token_id
+        if len(set(ids.values())) != len(STATE_TOKENS):
+            raise ValueError("Native state tokens must have distinct token IDs")
+        return ids
+
+    def probe_state(self, history, recent, question, direct=False, context_tokens=None):
+        """One unrestricted next-token decision, using cached visual features.
+
+        Record full-vocabulary probabilities: a non-state argmax is an explicit
+        protocol failure, never silently coerced into a confident state.
+        """
+        import torch
+
+        state_ids = self.state_token_ids()
+        frames = list(history) + list(recent)
+        limit = self.context_limit(context_tokens)
+        expected = self.count_state_input_tokens(history, recent, question, direct)
+        if expected + 1 > limit:
+            raise ValueError(f"State input ({expected}) plus one token exceeds context limit {limit}")
+        inputs, metrics = self.prepare_inputs(self.build_state_chat(history, recent, question, direct), frames)
+        if metrics["input_tokens"] != expected:
+            raise RuntimeError("Native state processor length differs from the validated context budget")
+        with cached_image_features(self.engine, frames) as hook, torch.inference_mode():
+            output = self.engine.model(**inputs, use_cache=False, logits_to_keep=1, return_dict=True)
+            logits = output.logits[0, -1].float()
+            if not bool(torch.isfinite(logits).all()):
+                raise RuntimeError("Nonfinite state logits")
+            probabilities = logits.softmax(dim=-1)
+            predicted_id = int(logits.argmax().item())
+            state_probabilities = {state: float(probabilities[token_id].item())
+                                   for state, token_id in state_ids.items()}
+            predicted_probability = float(probabilities[predicted_id].item())
+        if hook["calls"] != 1:
+            raise RuntimeError("Native cached state features were not consumed exactly once")
+        tokenizer = self.engine.processor.tokenizer
+        metrics.update(context_limit=limit, state_reserve_tokens=1,
+                       remaining_context_tokens=limit - expected - 1)
+        return dict(state=next((state for state, token_id in state_ids.items()
+                                if token_id == predicted_id), None),
+                    predicted_token=tokenizer.decode([predicted_id], skip_special_tokens=False),
+                    predicted_token_id=predicted_id, predicted_probability=predicted_probability,
+                    state_probabilities=state_probabilities,
+                    state_probability_mass=sum(state_probabilities.values()),
+                    **metrics)
 
     def select_history(self, candidates, recent, question, direct=False, max_tokens=16,
                        context_tokens=None):
@@ -788,6 +894,9 @@ def infer(job, rows, config=None, engine=None):
         device=job.get("device", "cuda"),
         attn_implementation=job.get("attn_implementation", "flash_attention_2"))
     adapter = NativeFeatureAdapter(engine)
+    if config.read_mode == "state":
+        # Fail before expensive video ingestion for incompatible checkpoints.
+        adapter.state_token_ids()
     groups = {}
     for row in rows:
         sample = Sample.from_dict(row)
@@ -855,7 +964,13 @@ def infer(job, rows, config=None, engine=None):
                 question = build_question_text(sample)
                 direct = sample.eval_mode != "mcq_letter"
                 selection_meta = {}
-                if config.read_mode == "fill":
+                if config.read_mode == "state":
+                    from onestreamer.state_readout import run_state_readout
+                    history, selection_meta = run_state_readout(
+                        adapter, bank.candidates(before=recent[0].timestamp), recent, question,
+                        direct=direct, history_budgets=config.state_history_budgets,
+                        max_tokens=16, context_tokens=config.context_tokens)
+                elif config.read_mode == "fill":
                     history, selection_meta = adapter.select_history(
                         bank.candidates(before=recent[0].timestamp), recent, question,
                         direct=direct, max_tokens=16, context_tokens=config.context_tokens)
@@ -883,6 +998,9 @@ def infer(job, rows, config=None, engine=None):
                            history_frame_tokens=[f.token_count for f in history],
                            history_read_frames=len(history), bank=bank.stats(),
                            history_selection_meta=selection_meta,
+                           state_probe_seconds=selection_meta.get("state_probe_seconds", 0.0),
+                           state_rounds=selection_meta.get("state_rounds", []),
+                           state_stop_reason=selection_meta.get("state_stop_reason"),
                            recent_timestamps=[f.timestamp for f in recent],
                            recent_frames=config.recent_frames, recent_read_frames=len(recent),
                            recent_image_sizes=recent_sizes,
@@ -938,8 +1056,10 @@ def main(argv=None):
     parser.add_argument("--history-store-mib", type=float, default=512)
     parser.add_argument("--history-read-frames", type=int, default=4)
     parser.add_argument("--history-read-tokens", type=int, default=1024)
-    parser.add_argument("--history-read-mode", choices=("fixed", "fill"), default="fixed",
-                        help="fill uses remaining context, ignoring fixed history read caps")
+    parser.add_argument("--history-read-mode", choices=("fixed", "fill", "state"), default="fixed",
+                        help="fill fills context; state progressively reads history using native readiness tokens")
+    parser.add_argument("--state-history-budgets", type=int, nargs="+", default=[1024, 4096, 16384],
+                        help="Strictly increasing historical visual-token budgets after the recent-only state probe")
     parser.add_argument("--context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
                         help="Total context cap including answer reserve; default: 32768 (32K)")
     parser.add_argument("--history-fps", type=float, default=1.0)
@@ -974,7 +1094,8 @@ def main(argv=None):
         history_max_pixels=args.history_max_pixels, seed=args.seed,
         read_mode=args.history_read_mode, context_tokens=args.context_tokens,
         history_compression=args.history_compression, pool_stride=args.history_pool_stride,
-        pool_age_seconds=args.history_pool_age_seconds, recent_frames=args.recent_frames)
+        pool_age_seconds=args.history_pool_age_seconds, recent_frames=args.recent_frames,
+        state_history_budgets=tuple(args.state_history_budgets))
     rows, original = _load_rows(args.manifest or args.samples)
     model_path = args.model_path or original.get("model_path")
     if not model_path:
@@ -1023,7 +1144,8 @@ def main(argv=None):
                                                  else "on_observation"),
                                   history_selection=("age_pool_then_drop_oldest_at_caps" if progressive
                                                      else "seeded_priority_reservoir"),
-                                  read_selection=("temporal_spread_context_fill" if config.read_mode == "fill"
+                                  read_selection=("native_state_progressive_visual_read" if config.read_mode == "state" else
+                                                  "temporal_spread_context_fill" if config.read_mode == "fill"
                                                   else "uniform_temporal"),
                                   recent_replay=("fixed_origin_fifo_cached_features" if pooled_stream
                                                  else "official_decoder"),
@@ -1031,6 +1153,18 @@ def main(argv=None):
                                   runtime_seconds=("cached_recent_readout_plus_qa" if pooled_stream
                                                    else "recent_decode_encode_readout_plus_qa"),
                                   storage_bytes="tensor_payload_including_deepstack"))
+    if config.read_mode == "state":
+        manifest["protocol"].update(state_prompt=STATE_PROMPT_VERSION,
+                                   state_probe="full_vocabulary_greedy_next_token",
+                                   state_invalid_fallback="answer_current_view",
+                                   state_task_labels=False,
+                                   state_budgets_include_initial_zero=True,
+                                   state_timing="included_in_recent_preparation_and_runtime_seconds")
+    source_paths = [Path(__file__)]
+    if config.read_mode == "state":
+        source_paths.append(Path(__file__).with_name("state_readout.py"))
+    manifest["source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                for path in source_paths}
     fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
     manifest["fingerprint"] = fingerprint
     if args.dry_run:
@@ -1055,6 +1189,7 @@ def main(argv=None):
     summary.update(wall_seconds_including_model_load=time.perf_counter() - started,
                    observation_seconds=sum(r["observation_seconds_delta"] for r in results),
                    query_seconds=sum(r["runtime_seconds"] for r in results),
+                   state_probe_seconds=sum(r.get("state_probe_seconds", 0.0) for r in results),
                    total_measured_seconds=sum(r["total_runtime_seconds"] for r in results))
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 

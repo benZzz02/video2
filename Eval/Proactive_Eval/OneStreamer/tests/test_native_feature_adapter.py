@@ -77,7 +77,7 @@ class NativeFeatureRoundtripTests(unittest.TestCase):
         inputs["pixel_values"] = torch.empty(0, dtype=self.model.dtype)
         return inputs
 
-    def processor_engine(self):
+    def processor_engine(self, native_states=False):
         from PIL import ImageOps
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
@@ -88,6 +88,8 @@ class NativeFeatureRoundtripTests(unittest.TestCase):
         vocab = {f"t{index}": index for index in range(64)}
         specials = {0: "[UNK]", 58: "<|vision_start|>", 59: "<|vision_end|>",
                     60: "<|image_pad|>", 61: "<|video_pad|>"}
+        if native_states:
+            specials.update({55: "</Response>", 56: "</Standby>", 57: "</Silence>"})
         for index, token in specials.items():
             del vocab[f"t{index}"]
             vocab[token] = index
@@ -95,7 +97,7 @@ class NativeFeatureRoundtripTests(unittest.TestCase):
         backend.pre_tokenizer = Whitespace()
         tokenizer = Qwen2TokenizerFast(
             tokenizer_object=backend, unk_token="[UNK]", eos_token="t2", pad_token="t1",
-            additional_special_tokens=[specials[index] for index in (58, 59, 60, 61)],
+            additional_special_tokens=[token for index, token in specials.items() if index != 0],
         )
         image_processor = Qwen2VLImageProcessor(
             patch_size=2, temporal_patch_size=2, merge_size=2,
