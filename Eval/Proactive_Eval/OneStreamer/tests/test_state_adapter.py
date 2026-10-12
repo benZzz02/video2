@@ -29,16 +29,33 @@ class StateAdapterTests(unittest.TestCase):
     def test_state_count_matches_native_processor_and_preserves_visual_question(self):
         final_chat = self.adapter.build_chat(self.history, self.recent, "t5 t6")
         state_chat = self.adapter.build_state_chat(self.history, self.recent, "t5 t6")
-        self.assertEqual(final_chat[1]["content"][:-1], state_chat[1]["content"][:-1])
-        self.assertIn("<QUESTION_TO_ASSESS>\nt5 t6\n</QUESTION_TO_ASSESS>",
-                      state_chat[1]["content"][-1]["text"])
-        self.assertTrue(state_chat[1]["content"][-1]["text"].endswith("State token:"))
+        self.assertEqual(final_chat[1]["content"][:-1], state_chat[2]["content"])
+        self.assertEqual([message["role"] for message in state_chat], ["system", "user", "user"])
+        self.assertTrue(state_chat[1]["content"][0]["text"].startswith("t5 t6\n"))
+        self.assertIn("begin with </Response> before the requested answer", state_chat[1]["content"][0]["text"])
+        state_text = " ".join(item.get("text", "") for message in state_chat for item in message["content"])
+        self.assertNotIn("Do not answer", state_text)
+        self.assertNotIn("State token:", state_text)
+        self.assertIn("</Response> followed by the answer", state_text)
         self.assertNotIn("</Response>", final_chat[0]["content"][0]["text"])
         self.assertIn("prediction", state_chat[0]["content"][0]["text"])
         self.assertIn("zero count", state_chat[0]["content"][0]["text"])
         inputs, _ = self.adapter.prepare_inputs(state_chat, self.history + self.recent)
         self.assertEqual(self.adapter.count_state_input_tokens(self.history, self.recent, "t5 t6"),
                          inputs["input_ids"].shape[-1])
+
+    def test_direct_and_option_formats_remain_answer_tasks_with_a_state_prefix(self):
+        for direct, question in ((False, "Question: What color?\nA. Red\nB. Blue\nBest option:("),
+                                 (True, "Is a cup visible? Answer only Yes or No."),
+                                 (True, "How many cups? Output only an integer.")):
+            with self.subTest(direct=direct, question=question):
+                before = self.adapter.build_chat(self.history, self.recent, question, direct)
+                state = self.adapter.build_state_chat(self.history, self.recent, question, direct)
+                after = self.adapter.build_chat(self.history, self.recent, question, direct)
+                self.assertEqual(before, after)
+                self.assertTrue(state[1]["content"][0]["text"].startswith(question + "\n"))
+                self.assertEqual(state[2]["content"], before[1]["content"][:-1])
+                self.assertIn("format applies to the answer after that prefix", state[0]["content"][0]["text"])
 
     def test_probe_uses_real_cached_prefill_and_unrestricted_probabilities(self):
         for predicted_id, expected in ((55, "</Response>"), (56, "</Standby>"),

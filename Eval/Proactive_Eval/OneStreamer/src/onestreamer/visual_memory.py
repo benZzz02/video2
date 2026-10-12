@@ -56,24 +56,25 @@ import time
 from typing import Any
 
 
-VERSION = "visual_memory_v5_state_readout"
+VERSION = "visual_memory_v6_native_state_prefix"
 DEFAULT_CONTEXT_TOKENS = 32768
 STATE_TOKENS = ("</Response>", "</Standby>", "</Silence>")
-STATE_PROMPT_VERSION = "native_readiness_v2"
+STATE_PROMPT_VERSION = "native_response_prefix_v3"
 STATE_SYSTEM_PROMPT = (
-    "Decide whether the supplied timestamped visual evidence is sufficient to answer the user's question. "
+    "You are a helpful assistant specializing in streaming video question answering. "
+    "Answer the user's question using only the supplied timestamped visual evidence. "
     "HISTORICAL_VISUAL_MEMORY contains sparse earlier observations; RECENT_VISUAL_CONTEXT contains "
     "the recent scene. Respect timestamps and distinguish earlier states from the current state. "
-    "Judge the evidence needed by this particular question. A question about the current scene can "
-    "be answerable from recent observations alone. A question about earlier events may require "
-    "earlier observations. A prediction asks for an inference from observed evidence, not for "
-    "observation of future frames. A supported negative answer or zero count is still an answer. "
-    "Missing historical frames alone do not establish that an event never happened. "
-    "Output exactly one native state token: </Response> if the available information is sufficient "
-    "to answer; </Standby> if relevant evidence is present but incomplete; </Silence> if the supplied "
-    "observations contain no relevant evidence. Output only that token. Do not answer the question, "
-    "describe the scene, or generate a caption. The question's answer-format instructions apply "
-    "to the subsequent answer, not to this state decision."
+    "Use the native response protocol at each update. When the available information is sufficient "
+    "to answer the question, begin with </Response> followed by the answer in the requested format. "
+    "Use </Standby> alone when relevant evidence is present but the question cannot yet be answered. "
+    "Use </Silence> alone when the observations provide no relevant evidence for the question. "
+    "Whenever you deliver an answer, begin with </Response>. The requested letter, Yes/No, or number "
+    "format applies to the answer after that prefix. A question about the current scene can be "
+    "answered from recent observations alone; a new event boundary is not required. "
+    "For a prediction question, infer from observed evidence without requiring future frames. "
+    "A supported negative answer or zero count is also an answer. Missing historical frames alone "
+    "do not establish that an event never happened."
 )
 
 
@@ -622,22 +623,19 @@ class NativeFeatureAdapter:
         return int(ids.shape[-1]) + sum(f.token_count - 1 for f in frames)
 
     def build_state_chat(self, history, recent, question, direct=False):
-        # Preserve the exact visual blocks and question. State decisions never
-        # become captions, memory records, or context for the final answer.
+        # Native states are prefixes of a QA response, not labels for a separate
+        # "do not answer" classification task. Keep the active question before
+        # the visual update, as in the native proactive-QA session. Only the
+        # first output token is evaluated by probe_state; no answer/caption is
+        # generated here or carried into the final answer/memory bank.
         chat = self.build_chat(history, recent, question, direct)
         chat[0]["content"] = [dict(type="text", text=STATE_SYSTEM_PROMPT)]
-        # The evaluation question can itself end with "Best option:(" or
-        # "answer only Yes/No". Quote it as the task being assessed and put
-        # the current state request last, without altering the answer prompt.
-        chat[1]["content"][-1] = dict(type="text", text=(
-            "<QUESTION_TO_ASSESS>\n" + question + "\n</QUESTION_TO_ASSESS>\n"
-            "Do not answer the quoted question yet. Its letter, Yes/No, or number format applies "
-            "only when an answer is requested later. For this turn, assess whether the visual "
-            "evidence already supplied is enough to answer it. Emit exactly one state token: "
-            "</Response> for sufficient evidence, </Standby> for relevant but incomplete evidence, "
-            "or </Silence> for no relevant evidence. State token:"
-        ))
-        return chat
+        question_turn = dict(role="user", content=[dict(type="text", text=(
+            question + "\nWhen you can answer, begin with </Response> before the requested answer. "
+            "Otherwise use the native </Standby> or </Silence> protocol."
+        ))])
+        visual_turn = dict(role="user", content=chat[1]["content"][:-1])
+        return [chat[0], question_turn, visual_turn]
 
     def count_state_input_tokens(self, history, recent, question, direct=False):
         return self._count_chat_tokens(self.build_state_chat(history, recent, question, direct),
@@ -689,6 +687,7 @@ class NativeFeatureAdapter:
             raise RuntimeError("Native cached state features were not consumed exactly once")
         tokenizer = self.engine.processor.tokenizer
         metrics.update(context_limit=limit, state_reserve_tokens=1,
+                       state_prompt_version=STATE_PROMPT_VERSION,
                        remaining_context_tokens=limit - expected - 1)
         return dict(state=next((state for state, token_id in state_ids.items()
                                 if token_id == predicted_id), None),
