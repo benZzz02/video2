@@ -29,35 +29,42 @@ class PureTests(unittest.TestCase):
         parser = runner.build_parser()
         for flags, mode, budgets in [([], "fill", [1024, 4096, 16384]),
                                      (["--history-read-mode", "state", "--state-history-budgets", "512", "2048"],
-                                      "state", [512, 2048])]:
+                                      "state", [512, 2048]),
+                                     (["--history-read-mode", "action"], "action", [1024, 4096, 16384])]:
             args = parser.parse_args(["--output", "/tmp/test-output", *flags])
             config = runner.configuration(args)
             self.assertEqual(config["read_mode"], mode)
             self.assertEqual(config["state_history_budgets"], budgets)
+            self.assertEqual(config["context_tokens"], 131072)
             self.assertEqual(config, json.loads(json.dumps(config)))
             cmd = runner.command(args, "/tmp/samples.json", args.output)
             self.assertEqual(cmd[cmd.index("--history-read-mode") + 1], mode)
             self.assertEqual(cmd[cmd.index("--state-history-budgets") + 1:], list(map(str, budgets)))
 
     def test_invalid_state_budgets_fail_before_manifest_or_gpu_access(self):
-        for budgets in [[], [0], [-1], [1024, 1024], [4096, 1024]]:
-            with self.subTest(budgets=budgets), self.assertRaises(ValueError):
-                runner.configuration(SimpleNamespace(history_read_mode="state", state_history_budgets=budgets))
+        for mode in ("state", "action"):
+            for budgets in [[], [0], [-1], [1024, 1024], [4096, 1024]]:
+                with self.subTest(mode=mode, budgets=budgets), self.assertRaises(ValueError):
+                    runner.configuration(SimpleNamespace(history_read_mode=mode, state_history_budgets=budgets))
 
     def test_untracked_controller_is_in_source_identity(self):
-        name = "Eval/Proactive_Eval/OneStreamer/src/onestreamer/state_readout.py"
+        names = ["Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
+                 for name in ("state_readout.py", "action_readout.py")]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            controller = root / name
-            controller.parent.mkdir(parents=True)
-            controller.write_text("controller_v1\n")
+            for name in names:
+                controller = root / name
+                controller.parent.mkdir(parents=True, exist_ok=True)
+                controller.write_text("controller_v1\n")
             with patch.object(runner, "ROOT", root), patch.object(runner.subprocess, "check_output", return_value=b""):
                 original = runner.source_hashes()
-                controller.write_text("controller_v2\n")
-                changed = runner.source_hashes()
-            self.assertIn(name, original)
-            self.assertNotEqual(original[name], changed[name])
-            self.assertNotEqual(runner.digest(original), runner.digest(changed))
+                for name in names:
+                    (root / name).write_text("controller_v2\n")
+                    changed = runner.source_hashes()
+                    self.assertIn(name, original)
+                    self.assertNotEqual(original[name], changed[name])
+                    self.assertNotEqual(runner.digest(original), runner.digest(changed))
+                    original = changed
 
     def test_readout_options_participate_in_prepared_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -79,12 +86,16 @@ class PureTests(unittest.TestCase):
                 baseline = runner.prepare(args)
                 args.history_read_mode = "state"
                 state = runner.prepare(args)
+                args.history_read_mode = "action"
+                action = runner.prepare(args)
                 args.state_history_budgets = [512, 2048]
                 different_budget = runner.prepare(args)
             self.assertEqual(state["identity"]["config"]["read_mode"], "state")
+            self.assertEqual(action["identity"]["config"]["read_mode"], "action")
             self.assertEqual(different_budget["identity"]["config"]["state_history_budgets"], [512, 2048])
             self.assertNotEqual(baseline["fingerprint"], state["fingerprint"])
-            self.assertNotEqual(state["fingerprint"], different_budget["fingerprint"])
+            self.assertNotEqual(state["fingerprint"], action["fingerprint"])
+            self.assertNotEqual(action["fingerprint"], different_budget["fingerprint"])
 
     def test_grouping_and_balance_are_order_independent(self):
         rows = [sample("0", end=30), sample("1", end=40), sample("2", "b.mp4", end=30),
@@ -120,6 +131,35 @@ class PureTests(unittest.TestCase):
         changed["fingerprint"] = "broken"
         with self.assertRaisesRegex(ValueError, "fingerprint is invalid"):
             runner.verify_identity(changed, original)
+
+    def test_merge_keeps_action_decisions_and_executor_stops_separate(self):
+        rows = [dict(sample(str(i)), model_alias="OneStreamer-4B", variant="fake_visual",
+                     status="ok", prediction="A", hit=True, observation_seconds_delta=1,
+                     runtime_seconds=2, total_runtime_seconds=3) for i in range(3)]
+        rows[0].update(action_rounds=[{"action": "STOP"}], action_probe_seconds=.5,
+                       action_invalid_count=0, action_stop_reason="model_stop")
+        rows[1].update(action_rounds=[{"action": None}, {"action": "READ_MORE"}],
+                       action_probe_seconds=1.5, action_invalid_count=1,
+                       action_stop_reason="history_budget_exhausted")
+        # The executor may finish without invoking the model when no history
+        # is available. It must not fabricate a STOP action for that sample.
+        rows[2].update(action_rounds=[], action_probe_seconds=0,
+                       action_invalid_count=0, action_stop_reason="history_exhausted")
+        manifest = dict(identity=dict(samples=rows, shards=[["0", "2"], ["1"]]), fingerprint="test")
+        state = {}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(runner, "collect", return_value=({r["sample_id"]: r for r in rows}, {})):
+            output = Path(directory)
+            runner.merge(output, manifest, state)
+            summary = json.loads((output / "summary.json").read_text())
+        self.assertEqual(summary["action_probe_seconds"], 2)
+        self.assertEqual(summary["action_probe_count"], 3)
+        self.assertEqual(summary["action_invalid_count"], 1)
+        self.assertEqual(summary["action_counts"], {"STOP": 1, "READ_MORE": 1, "invalid_action": 1})
+        self.assertEqual(summary["action_stop_reasons"], {
+            "model_stop": 1, "history_budget_exhausted": 1, "history_exhausted": 1})
+        self.assertEqual(summary["state_probe_count"], 0)
+        self.assertEqual(summary["state_stop_reasons"], {})
 
 
 # This child stands in for run_visual_memory.sh, exercises real subprocess and
@@ -202,6 +242,10 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(summary["state_probe_seconds"], 2.5)
         self.assertEqual(summary["state_probe_count"], 6)
         self.assertEqual(summary["state_stop_reasons"], {"response": 2, "history_exhausted": 2})
+        self.assertEqual(summary["action_probe_count"], 0)
+        self.assertEqual(summary["action_invalid_count"], 0)
+        self.assertEqual(summary["action_counts"], {})
+        self.assertEqual(summary["action_stop_reasons"], {})
         self.assertEqual(self.state["per_shard_completed"], [2, 2])
         # Tampering with a source attempt is rejected on the next resume/merge.
         path = self.output / attempts[0]["directory"] / "predictions.jsonl"

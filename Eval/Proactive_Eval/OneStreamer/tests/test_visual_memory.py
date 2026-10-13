@@ -885,6 +885,23 @@ class RunnerIntegrationTests(unittest.TestCase):
                     self.engine.fill_calls.append((list(candidates), context_tokens))
                     return list(candidates), {"eligible_history_frames": len(candidates)}
 
+                def read_action_token_ids(self):
+                    return {"A": 53, "B": 54}
+
+                def context_limit(self, cap):
+                    return cap
+
+                def count_input_tokens(self, history, recent, question_text, direct=False):
+                    return 20 + sum(item.token_count for item in history + recent)
+
+                def count_read_action_input_tokens(self, history, recent, question_text, status, direct=False):
+                    return self.count_input_tokens(history, recent, question_text, direct) + 30
+
+                def probe_read_action(self, history, recent, question_text, status,
+                                      direct=False, context_tokens=None):
+                    self.engine.action_calls.append((list(history), list(recent), question_text, status))
+                    return {"action": "READ_MORE"}
+
                 def answer(self, history, recent, question_text, direct, max_tokens, context_tokens=None):
                     self.engine.answer_calls.append((history, recent, question_text, direct, max_tokens))
                     visual_tokens = sum(item.token_count for item in (*history, *recent))
@@ -896,18 +913,23 @@ class RunnerIntegrationTests(unittest.TestCase):
             # be unnecessary. Keep this test independent of model installations.
             engine_module = ModuleType("onestreamer.engine")
             engine_module.OneStreamerEngine = lambda **kwargs: self.fail("Unexpected model load")
-            cases = [(capacity, read_mode, recent_count)
-                     for capacity, read_mode in ((64, "fixed"), (0, "fixed"), (64, "fill"), (0, "fill"))
-                     for recent_count in (1, 4, 8, 16, 32)]
-            for capacity, read_mode, recent_count in cases:
-                with self.subTest(history_capacity=capacity, read_mode=read_mode, recent_frames=recent_count):
+            cases = [(capacity, read_mode, recent_count, origin)
+                     for capacity, read_mode in ((64, "fixed"), (0, "fixed"), (64, "fill"), (0, "fill"),
+                                                 (64, "action"), (0, "action"))
+                     for recent_count in (1, 4, 8, 16, 32)
+                     for origin in ((0.0, 0.15) if read_mode == "action" else (0.0,))]
+            for capacity, read_mode, recent_count, origin in cases:
+                with self.subTest(history_capacity=capacity, read_mode=read_mode,
+                                  recent_frames=recent_count, origin=origin):
                     engine = SimpleNamespace(
                         device="cpu", history_encoded=[], recent_encoded=[], answer_calls=[], fill_calls=[],
+                        action_calls=[],
                     )
                     with patch.dict(sys.modules, {"onestreamer.engine": engine_module}), \
                             patch.object(visual_memory, "NativeFeatureAdapter", FakeAdapter):
                         results = list(visual_memory.infer(
-                            job, rows, MemoryConfig(capacity=capacity, read_mode=read_mode,
+                            job, [dict(row, start=origin) for row in rows],
+                            MemoryConfig(capacity=capacity, read_mode=read_mode,
                                                     context_tokens=8192, recent_frames=recent_count), engine=engine,
                         ))
                     self.assertEqual([row["sample_id"] for row in results], ["early", "late-a", "late-z"])
@@ -940,6 +962,22 @@ class RunnerIntegrationTests(unittest.TestCase):
                             self.assertEqual(results[1]["history_read_frames"], max(1, 21 - recent_count))
                     else:
                         self.assertEqual(engine.fill_calls, [])
+                    if read_mode == "action":
+                        for result, answer_call in zip(results, engine.answer_calls):
+                            self.assertEqual(result["history_timestamps"], [f.timestamp for f in answer_call[0]])
+                            self.assertEqual(result["recent_timestamps"], [f.timestamp for f in answer_call[1]])
+                            self.assertIn(result["question"], answer_call[2])
+                            self.assertEqual(result["action_invalid_count"], 0)
+                            self.assertIn(result["action_stop_reason"], ("no_history", "history_exhausted"))
+                            for probe in result["action_rounds"]:
+                                status = probe["history_status"]
+                                self.assertEqual(status["query_time"], result["end"])
+                                self.assertEqual(status["stream_start"], result["start"])
+                                self.assertLess(status["recent_end"], status["query_time"])
+                                self.assertEqual(probe["action"], "READ_MORE")
+                        self.assertEqual(len(engine.action_calls), sum(len(r["action_rounds"]) for r in results))
+                        if not capacity:
+                            self.assertEqual(engine.action_calls, [])
                     summary = aggregate(results)
                     self.assertEqual(summary["rows"], 3)
                     self.assertEqual(summary["metrics"][0]["sample_micro_accuracy"], 1.0)

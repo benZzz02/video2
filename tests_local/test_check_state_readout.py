@@ -20,7 +20,7 @@ class DiagnosticTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         (self.root / "video.mp4").write_bytes(b"fake-video")
         (self.root / "config.json").write_text("{}")
         (self.root / "tokenizer_config.json").write_text("{}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-GPU local OVO runner for fill or state-driven visual-memory readout.
+"""Two-GPU local OVO runner for fill, state, or action visual-memory readout.
 
 Use --dry-run to validate, then run with --output results/RUN. Restart with
 --resume and the same output. Successful answers retain their attempt fingerprint.
@@ -69,8 +69,9 @@ def source_hashes():
         ["git", "ls-files", "-z", "Eval", "run_visual_memory.sh"], cwd=ROOT).decode().split("\0")
     sources = {name: file_sha(ROOT / name) for name in tracked if name and (ROOT / name).is_file()}
     # New local modules must participate in resume identity before a git add.
-    controller = "Eval/Proactive_Eval/OneStreamer/src/onestreamer/state_readout.py"
-    sources[controller] = file_sha(ROOT / controller)
+    for name in ("state_readout.py", "action_readout.py"):
+        controller = "Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
+        sources[controller] = file_sha(ROOT / controller)
     sources["tools/run_visual_ovo_local.py"] = file_sha(Path(__file__).resolve())
     return sources
 
@@ -249,6 +250,13 @@ def merge(output, manifest, state):
                    state_probe_count=sum(len(r.get("state_rounds", [])) for r in ordered),
                    state_stop_reasons=dict(Counter(r["state_stop_reason"] for r in ordered
                                                    if r.get("state_stop_reason") is not None)),
+                   action_probe_seconds=sum(r.get("action_probe_seconds", 0.0) for r in ordered),
+                   action_probe_count=sum(len(r.get("action_rounds", [])) for r in ordered),
+                   action_invalid_count=sum(r.get("action_invalid_count", 0) for r in ordered),
+                   action_counts=dict(Counter(step.get("action") or "invalid_action"
+                                              for r in ordered for step in r.get("action_rounds", []))),
+                   action_stop_reasons=dict(Counter(r["action_stop_reason"] for r in ordered
+                                                    if r.get("action_stop_reason") is not None)),
                    run_fingerprint=manifest["fingerprint"], completed_at=utc_now())
     temporary = output / "predictions.jsonl.tmp"
     with temporary.open("w") as handle:
@@ -403,8 +411,8 @@ def build_parser():
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--video-root", type=Path, default=DEFAULT_VIDEOS)
     parser.add_argument("--python", default=os.environ.get("EVAL_PYTHON", DEFAULT_PYTHON))
-    parser.add_argument("--history-read-mode", choices=("fill", "state"), default="fill",
-                        help="Fill available context, or expand historical visual evidence using native state tokens")
+    parser.add_argument("--history-read-mode", choices=("fill", "state", "action"), default="fill",
+                        help="Fill context, use native response states, or explicitly decide whether to read more history")
     parser.add_argument("--state-history-budgets", type=int, nargs="+",
                         default=DEFAULT_STATE_HISTORY_BUDGETS, metavar="TOKENS",
                         help="Strictly increasing positive historical visual-token budgets after the recent-only probe")

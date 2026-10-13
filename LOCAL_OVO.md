@@ -1,5 +1,10 @@
 # 本机 OVO-Bench 视觉 memory 实验
 
+新增 `action` 历史读取模式的协议、运行命令与输出字段见
+[ACTION_READOUT.md](ACTION_READOUT.md)。该模式显式判断“停止 / 继续读取”，
+不使用原生应答状态作为停止信号。以下已报告分数均属于对应的既有实验；
+新模式需要使用独立结果目录评测，双卡包装默认仍为 `fill` 和 128K 总上下文。
+
 ## 来源与环境
 
 - 仓库：`https://github.com/benZzz02/video2`

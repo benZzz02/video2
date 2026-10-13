@@ -77,7 +77,7 @@ class NativeFeatureRoundtripTests(unittest.TestCase):
         inputs["pixel_values"] = torch.empty(0, dtype=self.model.dtype)
         return inputs
 
-    def processor_engine(self, native_states=False):
+    def processor_engine(self, native_states=False, read_actions=False):
         from PIL import ImageOps
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
@@ -93,6 +93,11 @@ class NativeFeatureRoundtripTests(unittest.TestCase):
         for index, token in specials.items():
             del vocab[f"t{index}"]
             vocab[token] = index
+        if read_actions:
+            # Ordinary existing-vocabulary labels, deliberately not special tokens.
+            for index, label in ((53, "A"), (54, "B")):
+                del vocab[f"t{index}"]
+                vocab[label] = index
         backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
         backend.pre_tokenizer = Whitespace()
         tokenizer = Qwen2TokenizerFast(
