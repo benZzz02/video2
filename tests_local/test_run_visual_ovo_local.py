@@ -34,12 +34,18 @@ class PureTests(unittest.TestCase):
             args = parser.parse_args(["--output", "/tmp/test-output", *flags])
             config = runner.configuration(args)
             self.assertEqual(config["read_mode"], mode)
+            self.assertEqual(config["answer_prompt"], "standard")
             self.assertEqual(config["state_history_budgets"], budgets)
             self.assertEqual(config["context_tokens"], 131072)
             self.assertEqual(config, json.loads(json.dumps(config)))
             cmd = runner.command(args, "/tmp/samples.json", args.output)
             self.assertEqual(cmd[cmd.index("--history-read-mode") + 1], mode)
+            self.assertEqual(cmd[cmd.index("--answer-prompt") + 1], "standard")
             self.assertEqual(cmd[cmd.index("--state-history-budgets") + 1:], list(map(str, budgets)))
+        args = parser.parse_args(["--output", "/tmp/test-output", "--answer-prompt", "frame_id_witness"])
+        self.assertEqual(runner.configuration(args)["answer_prompt"], "frame_id_witness")
+        cmd = runner.command(args, "/tmp/samples.json", args.output)
+        self.assertEqual(cmd[cmd.index("--answer-prompt") + 1], "frame_id_witness")
 
     def test_invalid_state_budgets_fail_before_manifest_or_gpu_access(self):
         for mode in ("state", "action"):
@@ -47,9 +53,14 @@ class PureTests(unittest.TestCase):
                 with self.subTest(mode=mode, budgets=budgets), self.assertRaises(ValueError):
                     runner.configuration(SimpleNamespace(history_read_mode=mode, state_history_budgets=budgets))
 
+    def test_witness_prompt_rejects_incompatible_read_modes_before_gpu_access(self):
+        for mode in ("state", "action"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "requires read_mode=fill"):
+                runner.configuration(SimpleNamespace(history_read_mode=mode, answer_prompt="frame_id_witness"))
+
     def test_untracked_controller_is_in_source_identity(self):
         names = ["Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
-                 for name in ("state_readout.py", "action_readout.py")]
+                 for name in ("state_readout.py", "action_readout.py", "frame_evidence.py")]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in names:
@@ -90,12 +101,18 @@ class PureTests(unittest.TestCase):
                 action = runner.prepare(args)
                 args.state_history_budgets = [512, 2048]
                 different_budget = runner.prepare(args)
+                args.history_read_mode = "fill"
+                fill_budget = runner.prepare(args)
+                args.answer_prompt = "frame_id_witness"
+                witness = runner.prepare(args)
             self.assertEqual(state["identity"]["config"]["read_mode"], "state")
             self.assertEqual(action["identity"]["config"]["read_mode"], "action")
             self.assertEqual(different_budget["identity"]["config"]["state_history_budgets"], [512, 2048])
+            self.assertEqual(witness["identity"]["config"]["answer_prompt"], "frame_id_witness")
             self.assertNotEqual(baseline["fingerprint"], state["fingerprint"])
             self.assertNotEqual(state["fingerprint"], action["fingerprint"])
             self.assertNotEqual(action["fingerprint"], different_budget["fingerprint"])
+            self.assertNotEqual(fill_budget["fingerprint"], witness["fingerprint"])
 
     def test_grouping_and_balance_are_order_independent(self):
         rows = [sample("0", end=30), sample("1", end=40), sample("2", "b.mp4", end=30),

@@ -47,6 +47,7 @@ CONFIG = json.loads(json.dumps(asdict(MemoryConfig(
 def configuration(args):
     values = dict(CONFIG)
     values.update(read_mode=getattr(args, "history_read_mode", "fill"),
+                  answer_prompt=getattr(args, "answer_prompt", "standard"),
                   state_history_budgets=tuple(getattr(
                       args, "state_history_budgets", DEFAULT_STATE_HISTORY_BUDGETS)))
     return json.loads(json.dumps(asdict(MemoryConfig(**values))))
@@ -69,7 +70,7 @@ def source_hashes():
         ["git", "ls-files", "-z", "Eval", "run_visual_memory.sh"], cwd=ROOT).decode().split("\0")
     sources = {name: file_sha(ROOT / name) for name in tracked if name and (ROOT / name).is_file()}
     # New local modules must participate in resume identity before a git add.
-    for name in ("state_readout.py", "action_readout.py"):
+    for name in ("state_readout.py", "action_readout.py", "frame_evidence.py"):
         controller = "Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
         sources[controller] = file_sha(ROOT / controller)
     sources["tools/run_visual_ovo_local.py"] = file_sha(Path(__file__).resolve())
@@ -223,6 +224,7 @@ def command(args, samples, output):
             "--model-path", str(args.model_path), "--video-root", str(args.video_root),
             "--output", str(output), "--context-tokens", str(config["context_tokens"]),
             "--attn-implementation", "sdpa", "--history-read-mode", config["read_mode"],
+            "--answer-prompt", config["answer_prompt"],
             "--state-history-budgets", *map(str, config["state_history_budgets"])]
 
 
@@ -413,6 +415,8 @@ def build_parser():
     parser.add_argument("--python", default=os.environ.get("EVAL_PYTHON", DEFAULT_PYTHON))
     parser.add_argument("--history-read-mode", choices=("fill", "state", "action"), default="fill",
                         help="Fill context, use native response states, or explicitly decide whether to read more history")
+    parser.add_argument("--answer-prompt", choices=("standard", "frame_id_witness"), default="standard",
+                        help="Final-answer prompt: original QA or experimental frame-ID witness")
     parser.add_argument("--state-history-budgets", type=int, nargs="+",
                         default=DEFAULT_STATE_HISTORY_BUDGETS, metavar="TOKENS",
                         help="Strictly increasing positive historical visual-token budgets after the recent-only probe")

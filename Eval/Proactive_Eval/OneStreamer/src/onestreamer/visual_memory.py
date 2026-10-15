@@ -28,6 +28,9 @@ visual-token caps. State decisions never enter the final answer or memory bank.
 --history-read-mode action instead asks whether to STOP or READ_MORE using
 ordinary A/B tokens and truthful unread-history metadata. It uses the same
 budget schedule; the program enforces exhaustion and records invalid actions.
+--answer-prompt frame_id_witness runs an exploratory two-line answer and
+frame-citation prompt with --history-read-mode fill. It retains the raw answer
+and structurally audits cited frame IDs; citations are not proof of support.
 --context-tokens sets a total cap (default 32768), bounded by the model config.
 The historical writer and temporal frame ordering are model independent;
 the optional state readout policy depends on the frozen checkpoint's decisions.
@@ -137,6 +140,7 @@ class MemoryConfig:
     pool_age_seconds: float = 60.0
     recent_frames: int = 16
     state_history_budgets: tuple[int, ...] = (1024, 4096, 16384)
+    answer_prompt: str = "standard"
 
     def __post_init__(self):
         for name in ("capacity", "store_tokens", "store_bytes", "read_frames", "read_tokens"):
@@ -149,6 +153,10 @@ class MemoryConfig:
             raise ValueError("history_max_pixels must be at least 1024")
         if self.read_mode not in {"fixed", "fill", "state", "action"}:
             raise ValueError("read_mode must be fixed, fill, state or action")
+        if self.answer_prompt not in {"standard", "frame_id_witness"}:
+            raise ValueError("answer_prompt must be standard or frame_id_witness")
+        if self.answer_prompt == "frame_id_witness" and self.read_mode != "fill":
+            raise ValueError("frame_id_witness requires read_mode=fill")
         budgets = self.state_history_budgets
         if (not budgets or any(not isinstance(x, int) or isinstance(x, bool) or x <= 0 for x in budgets)
                 or any(a >= b for a, b in zip(budgets, budgets[1:]))):
@@ -644,9 +652,21 @@ class NativeFeatureAdapter:
             raise ValueError("context_tokens must be a positive integer")
         return min(model_limit, context_tokens if context_tokens is not None else DEFAULT_CONTEXT_TOKENS)
 
-    def count_input_tokens(self, history, recent, question, direct=False):
+    def build_answer_chat(self, history, recent, question, direct=False,
+                          answer_prompt="standard", eval_mode=None, history_indices=None):
+        if answer_prompt == "standard":
+            return self.build_chat(history, recent, question, direct)
+        if answer_prompt != "frame_id_witness":
+            raise ValueError(f"Unknown answer prompt: {answer_prompt}")
+        from onestreamer import frame_evidence
+        specs = frame_evidence.frame_specs(history, recent, history_indices or {})
+        return frame_evidence.build_chat(self, history, recent, question, direct, specs, eval_mode)
+
+    def count_input_tokens(self, history, recent, question, direct=False,
+                           answer_prompt="standard", eval_mode=None, history_indices=None):
         """Exact expanded length, without preprocessing images or running ViT."""
-        return self._count_chat_tokens(self.build_chat(history, recent, question, direct),
+        return self._count_chat_tokens(self.build_answer_chat(
+            history, recent, question, direct, answer_prompt, eval_mode, history_indices),
                                        list(history) + list(recent))
 
     def _count_chat_tokens(self, chat, frames):
@@ -814,7 +834,8 @@ class NativeFeatureAdapter:
                     action_probability_mass=sum(action_probabilities.values()), **metrics)
 
     def select_history(self, candidates, recent, question, direct=False, max_tokens=16,
-                       context_tokens=None):
+                       context_tokens=None, answer_prompt="standard", eval_mode=None,
+                       history_indices=None):
         """Greedily fill the remaining context with whole stored image bundles.
 
         Try temporally spread candidates first, continuing past images that do
@@ -824,7 +845,10 @@ class NativeFeatureAdapter:
         limit = self.context_limit(context_tokens)
         if max_tokens <= 0 or max_tokens >= limit:
             raise ValueError("Answer reserve must be positive and smaller than context limit")
-        base = self.count_input_tokens([], recent, question, direct)
+        prompt_kwargs = ({} if answer_prompt == "standard" else
+                         dict(answer_prompt=answer_prompt, eval_mode=eval_mode,
+                              history_indices=history_indices))
+        base = self.count_input_tokens([], recent, question, direct, **prompt_kwargs)
         input_limit = limit - max_tokens
         if base > input_limit:
             raise ValueError(f"Recent context/question needs {base} input tokens plus {max_tokens} "
@@ -832,7 +856,7 @@ class NativeFeatureAdapter:
         candidates = sorted(candidates, key=lambda frame: frame.timestamp)
         # Validates causality, uniqueness and recent order even for images that
         # will eventually be rejected for their size.
-        self.build_chat(candidates, recent, question, direct)
+        self.build_answer_chat(candidates, recent, question, direct, **prompt_kwargs)
         order, seen = [], set()
         count = min(2, len(candidates))
         while count:
@@ -849,7 +873,7 @@ class NativeFeatureAdapter:
         def measure(items):
             nonlocal count_calls
             count_calls += 1
-            return self.count_input_tokens(items, recent, question, direct)
+            return self.count_input_tokens(items, recent, question, direct, **prompt_kwargs)
 
         # Large progressive banks can contain thousands of one-token records.
         # Avoid retokenizing a growing full prompt once per stored frame.
@@ -889,16 +913,20 @@ class NativeFeatureAdapter:
                               budget_count_calls=count_calls,
                               tail_candidates_skipped=tail_skipped)
 
-    def answer(self, history, recent, question, direct=False, max_tokens=16, context_tokens=None):
+    def answer(self, history, recent, question, direct=False, max_tokens=16, context_tokens=None,
+               answer_prompt="standard", eval_mode=None, history_indices=None):
         import torch
 
         frames = list(history) + list(recent)
         limit = self.context_limit(context_tokens)
-        expected = self.count_input_tokens(history, recent, question, direct)
+        prompt_kwargs = ({} if answer_prompt == "standard" else
+                         dict(answer_prompt=answer_prompt, eval_mode=eval_mode,
+                              history_indices=history_indices))
+        expected = self.count_input_tokens(history, recent, question, direct, **prompt_kwargs)
         if max_tokens <= 0 or expected + max_tokens > limit:
             raise ValueError(f"Input ({expected}) plus answer reserve ({max_tokens}) "
                              f"exceeds context limit {limit}")
-        chat = self.build_chat(history, recent, question, direct)
+        chat = self.build_answer_chat(history, recent, question, direct, **prompt_kwargs)
         inputs, metrics = self.prepare_inputs(chat, frames)
         if metrics["input_tokens"] != expected or metrics["input_tokens"] + max_tokens > limit:
             raise RuntimeError("Native processor length differs from the validated context budget")
@@ -1004,6 +1032,11 @@ def infer(job, rows, config=None, engine=None):
     from onestreamer.video import read_recent_frames
 
     config = config or MemoryConfig()
+    frame_evidence = None
+    if config.answer_prompt == "frame_id_witness":
+        from onestreamer import frame_evidence
+    answer_tokens = (frame_evidence.ANSWER_RESERVE_TOKENS if frame_evidence is not None
+                     else 16)
     engine = engine or OneStreamerEngine(
         model_path=job["model_path"], dtype=job.get("dtype", "bfloat16"),
         device=job.get("device", "cuda"),
@@ -1081,6 +1114,7 @@ def infer(job, rows, config=None, engine=None):
                 question = build_question_text(sample)
                 direct = sample.eval_mode != "mcq_letter"
                 selection_meta = {}
+                history_indices = None
                 if config.read_mode == "state":
                     from onestreamer.state_readout import run_state_readout
                     history, selection_meta = run_state_readout(
@@ -1095,9 +1129,18 @@ def infer(job, rows, config=None, engine=None):
                         history_budgets=config.state_history_budgets,
                         max_tokens=16, context_tokens=config.context_tokens)
                 elif config.read_mode == "fill":
-                    history, selection_meta = adapter.select_history(
-                        bank.candidates(before=recent[0].timestamp), recent, question,
-                        direct=direct, max_tokens=16, context_tokens=config.context_tokens)
+                    candidates = bank.candidates(before=recent[0].timestamp)
+                    if frame_evidence is not None:
+                        history_indices = {f.timestamp: i for i, f in enumerate(candidates)}
+                        history, selection_meta = adapter.select_history(
+                            candidates, recent, question, direct=direct,
+                            max_tokens=answer_tokens, context_tokens=config.context_tokens,
+                            answer_prompt=config.answer_prompt, eval_mode=sample.eval_mode,
+                            history_indices=history_indices)
+                    else:
+                        history, selection_meta = adapter.select_history(
+                            candidates, recent, question, direct=direct,
+                            max_tokens=answer_tokens, context_tokens=config.context_tokens)
                 else:
                     history = bank.read(before=recent[0].timestamp)
                 if any(f.timestamp >= sample.end for f in history):
@@ -1105,16 +1148,35 @@ def infer(job, rows, config=None, engine=None):
                 _sync(engine)
                 preparation_seconds = time.perf_counter() - start
                 qa_start = time.perf_counter()
-                prediction, metrics = adapter.answer(
-                    history, recent, question, direct=direct, max_tokens=16,
-                    context_tokens=config.context_tokens)
+                if frame_evidence is not None:
+                    raw_prediction, metrics = adapter.answer(
+                        history, recent, question, direct=direct, max_tokens=answer_tokens,
+                        context_tokens=config.context_tokens,
+                        answer_prompt=config.answer_prompt, eval_mode=sample.eval_mode,
+                        history_indices=history_indices)
+                    specs = frame_evidence.frame_specs(history, recent, history_indices)
+                    witness = frame_evidence.parse_witness(
+                        raw_prediction, specs, sample.eval_mode, question,
+                        valid_letters="".join(sample.options))
+                    prediction = frame_evidence.answer_for_scoring(witness)
+                    evidence_meta = dict(prompt_version=frame_evidence.PROMPT_VERSION,
+                                         frame_map=specs, **witness)
+                    evidence_fields = dict(raw_prediction=raw_prediction,
+                                           frame_evidence=evidence_meta)
+                else:
+                    prediction, metrics = adapter.answer(
+                        history, recent, question, direct=direct, max_tokens=answer_tokens,
+                        context_tokens=config.context_tokens)
+                    evidence_fields = {}
                 _sync(engine)
                 qa_seconds = time.perf_counter() - qa_start
                 parsed, hit = score_prediction(sample, prediction)
                 yield dict(row, model_alias=job.get("model", Path(job["model_path"]).name),
                            variant=(f"{VERSION}_{config.history_compression}_{config.read_mode}_r{config.recent_frames}"
-                                    + (f"_recent{config.recent_frames}_control" if not config.enabled else "")),
+                                    + (f"_recent{config.recent_frames}_control" if not config.enabled else "")
+                                    + ("_frame_id_witness_v2" if frame_evidence is not None else "")),
                            prediction=prediction, parsed_output=parsed, hit=hit,
+                           **evidence_fields,
                            memory_text="", memory_meta={"memory_tokens": 0}, caption_cache=None,
                            caption_counts={}, history_timestamps=[f.timestamp for f in history],
                            history_visual_tokens=sum(f.token_count for f in history),
@@ -1186,6 +1248,8 @@ def main(argv=None):
     parser.add_argument("--history-read-tokens", type=int, default=1024)
     parser.add_argument("--history-read-mode", choices=("fixed", "fill", "state", "action"), default="fixed",
                         help="fill fills context; state uses native readiness; action requests history with A/B actions")
+    parser.add_argument("--answer-prompt", choices=("standard", "frame_id_witness"),
+                        default="standard", help="Exploratory frame-ID witness answer requires --history-read-mode fill")
     parser.add_argument("--state-history-budgets", type=int, nargs="+", default=[1024, 4096, 16384],
                         help="Increasing historical visual-token budgets after the recent-only state/action probe")
     parser.add_argument("--context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
@@ -1223,7 +1287,12 @@ def main(argv=None):
         read_mode=args.history_read_mode, context_tokens=args.context_tokens,
         history_compression=args.history_compression, pool_stride=args.history_pool_stride,
         pool_age_seconds=args.history_pool_age_seconds, recent_frames=args.recent_frames,
-        state_history_budgets=tuple(args.state_history_budgets))
+        state_history_budgets=tuple(args.state_history_budgets), answer_prompt=args.answer_prompt)
+    if config.answer_prompt == "frame_id_witness":
+        from onestreamer.frame_evidence import ANSWER_RESERVE_TOKENS, PROMPT_VERSION
+        answer_tokens, recent_prompt = ANSWER_RESERVE_TOKENS, PROMPT_VERSION
+    else:
+        answer_tokens, recent_prompt = 16, "visual_memory_v0_common_control"
     rows, original = _load_rows(args.manifest or args.samples)
     model_path = args.model_path or original.get("model_path")
     if not model_path:
@@ -1263,7 +1332,9 @@ def main(argv=None):
     progressive = config.history_compression == "progressive_pool"
     manifest = dict(version=VERSION, config=asdict(config), job=job, samples=rows,
                     source_manifest=str((args.manifest or args.samples).resolve()),
-                    protocol=dict(recent_frames=config.recent_frames, recent_fps=1.0, answer_tokens=16,
+                    protocol=dict(recent_frames=config.recent_frames, recent_fps=1.0,
+                                  answer_tokens=answer_tokens,
+                                  answer_prompt=config.answer_prompt,
                                   caption_generation=False, history_sampling="fixed_origin_causal",
                                   history_storage=("pooled_native_features_with_deepstack" if pooled_stream
                                                    else "native_full_image_features_with_deepstack"),
@@ -1278,10 +1349,17 @@ def main(argv=None):
                                                   else "uniform_temporal"),
                                   recent_replay=("fixed_origin_fifo_cached_features" if pooled_stream
                                                  else "official_decoder"),
-                                  recent_prompt="visual_memory_v0_common_control",
+                                  recent_prompt=recent_prompt,
                                   runtime_seconds=("cached_recent_readout_plus_qa" if pooled_stream
                                                    else "recent_decode_encode_readout_plus_qa"),
                                   storage_bytes="tensor_payload_including_deepstack"))
+    if config.answer_prompt == "frame_id_witness":
+        manifest["protocol"].update(
+            witness_prompt=recent_prompt,
+            witness_answer_extraction="valid_ANSWER_line_independent_of_citation_format",
+            witness_frame_ids="H_index_in_query_eligible_stored_history_R_index_in_recent",
+            witness_citation_audit="syntax_and_supplied_frame_ids_only_not_semantic_support",
+            witness_task_labels_in_prompt=False)
     if config.read_mode == "state":
         manifest["protocol"].update(state_prompt=STATE_PROMPT_VERSION,
                                    state_probe="full_vocabulary_greedy_next_token",
@@ -1302,6 +1380,8 @@ def main(argv=None):
         source_paths.append(Path(__file__).with_name("state_readout.py"))
     if config.read_mode == "action":
         source_paths.append(Path(__file__).with_name("action_readout.py"))
+    if config.answer_prompt == "frame_id_witness":
+        source_paths.append(Path(__file__).with_name("frame_evidence.py"))
     manifest["source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                 for path in source_paths}
     fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
