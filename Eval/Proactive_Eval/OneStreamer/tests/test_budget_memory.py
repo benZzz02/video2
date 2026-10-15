@@ -182,6 +182,19 @@ class EndInclusiveSamplerTests(unittest.TestCase):
                 legacy = [t for t, _ in self.sampler(False).advance(end)]
                 self.assertEqual(len(observed), len(legacy) + (1 if end == int(end) else 0))
 
+    def test_question_at_video_end_includes_last_frame(self):
+        # OVO chunks are cut at the question time: end == duration (4.0 s here).
+        from onestreamer.video import read_recent_frames
+
+        sampler = self.sampler(True)
+        observed = [t for t, _ in sampler.advance(4.0)]
+        official = [t for t, _ in read_recent_frames(self.path, 0.0, 4.0, 16, 1.0)]
+        self.assertAlmostEqual(observed[-1], official[-1])
+        self.assertAlmostEqual(observed[-1], 3.9)
+        self.assertEqual(list(sampler.advance(5.0)), [])
+        legacy = [t for t, _ in self.sampler(False).advance(4.0)]
+        self.assertEqual(legacy[-1], 3.0)
+
     def test_incremental_queries_match_one_shot_and_cutoff_slot_is_not_lost(self):
         incremental = self.sampler(True)
         self.assertEqual(list(incremental.advance(0.0)), [])

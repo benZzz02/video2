@@ -1143,13 +1143,16 @@ class StreamSampler:
         duration = self.total_frames / self.source_fps
         while True:
             scheduled = self.origin + self.slot / self.fps
-            if scheduled >= duration or (scheduled > end if self.include_end else scheduled >= end):
+            # OVO chunks end exactly at the question time, so the end-inclusive
+            # slot may coincide with the video duration.
+            if (scheduled > min(end, duration) if self.include_end
+                    else scheduled >= duration or scheduled >= end):
                 break
             index = math.floor(scheduled * self.source_fps)
             if self.include_end:
                 # A slot at the cutoff takes the last source frame strictly
                 # before it, as the official end-aligned recent reader does.
-                cap = math.ceil(end * self.source_fps) - 1
+                cap = min(math.ceil(end * self.source_fps), self.total_frames) - 1
                 if index > cap and cap < self.current:
                     break  # No unread frame precedes the cutoff; keep the slot.
                 index = min(index, cap)

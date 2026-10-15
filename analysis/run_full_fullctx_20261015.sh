@@ -6,4 +6,4 @@ exec /home/zhangnuohua/miniconda3/envs/vllm/bin/python -u \
   tools/run_visual_ovo_local.py \
   --history-read-mode fill \
   --memory-layout full_context \
-  --output results/ovo-fill-full-context-2gpu-20261015 "$@"
+  --output results/ovo-fill-full-context-v2-2gpu-20261015 "$@"
