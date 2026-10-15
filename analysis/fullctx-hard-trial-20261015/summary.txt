@@ -1,0 +1,30 @@
+group       done/sel  new_correct  R_correct  oldFill_correct  old_hist_span_s  new_hist_span_s
+EPM          30/30        6           0           0               32           258
+SSR          20/20        2           0           0               93           145
+ASI          10/10        0           0           0               93           195
+CRR          15/15        1           0           0              589           589
+REC          15/15        0           0           0               30            30
+RT_control   20/20        3          20           0               93           160
+input_tokens max 129814 median 55298.5 | qa_seconds median 13.0 max 57.8
+budget violations 0 | earliest!=first 0
+
+changed answers (new vs old Fill):
+  ovo-0552 ASI        gt=D     R=B     oldF=B     new=A     hit=0 hist_frames 93->402
+  ovo-0575 ASI        gt=C     R=B     oldF=B     new=D     hit=0 hist_frames 93->346
+  ovo-1531 CRR        gt=Yes   R=no    oldF=no    new=yes   hit=1 hist_frames 874->874
+  ovo-0016 EPM        gt=A     R=C     oldF=C     new=A     hit=1 hist_frames 23->325
+  ovo-0199 EPM        gt=C     R=D     oldF=D     new=C     hit=1 hist_frames 32->94
+  ovo-0226 EPM        gt=D     R=C     oldF=B     new=D     hit=1 hist_frames 32->52
+  ovo-0228 EPM        gt=C     R=D     oldF=D     new=C     hit=1 hist_frames 32->89
+  ovo-0264 EPM        gt=D     R=C     oldF=C     new=D     hit=1 hist_frames 32->147
+  ovo-0287 EPM        gt=B     R=C     oldF=D     new=B     hit=1 hist_frames 32->104
+  ovo-2553 REC        gt=4     R=0     oldF=1     new=2     hit=0 hist_frames 152->152
+  ovo-3021 REC        gt=9     R=1     oldF=2     new=3     hit=0 hist_frames 82->82
+  ovo-0657 RT_control gt=B     R=B     oldF=D     new=B     hit=1 hist_frames 491->491
+  ovo-0740 RT_control gt=B     R=B     oldF=A     new=B     hit=1 hist_frames 93->327
+  ovo-0772 RT_control gt=D     R=D     oldF=C     new=A     hit=0 hist_frames 93->124
+  ovo-0824 RT_control gt=C     R=C     oldF=B     new=D     hit=0 hist_frames 204->204
+  ovo-0926 RT_control gt=B     R=B     oldF=D     new=A     hit=0 hist_frames 93->585
+  ovo-0979 RT_control gt=A     R=A     oldF=D     new=A     hit=1 hist_frames 41->89
+  ovo-2237 SSR        gt=Yes   R=no    oldF=no    new=yes   hit=1 hist_frames 93->180
+  ovo-2335 SSR        gt=Yes   R=no    oldF=no    new=yes   hit=1 hist_frames 93->98

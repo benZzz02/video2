@@ -44,8 +44,17 @@ CONFIG = json.loads(json.dumps(asdict(MemoryConfig(
     history_compression="progressive_pool", recent_frames=16))))
 
 
+# Bank sized per stream to the context left after Recent16 and the prompt;
+# 20 KiB/token (features + DeepStack) puts ~90K tokens near 1.8 GiB.
+FULL_CONTEXT_LAYOUT = dict(history_compression="budget_pool", store_budget="context",
+                           store_tokens=131072, capacity=131072, store_bytes=4096 * 1024**2,
+                           stream_include_end=True)
+
+
 def configuration(args):
     values = dict(CONFIG)
+    if getattr(args, "memory_layout", "progressive") == "full_context":
+        values.update(FULL_CONTEXT_LAYOUT)
     values.update(read_mode=getattr(args, "history_read_mode", "fill"),
                   answer_prompt=getattr(args, "answer_prompt", "standard"),
                   state_history_budgets=tuple(getattr(
@@ -225,7 +234,15 @@ def command(args, samples, output):
             "--output", str(output), "--context-tokens", str(config["context_tokens"]),
             "--attn-implementation", "sdpa", "--history-read-mode", config["read_mode"],
             "--answer-prompt", config["answer_prompt"],
-            "--state-history-budgets", *map(str, config["state_history_budgets"])]
+            "--state-history-budgets", *map(str, config["state_history_budgets"]),
+            *(["--history-compression", config["history_compression"],
+               "--history-store-budget", config["store_budget"],
+               "--history-store-tokens", str(config["store_tokens"]),
+               "--history-capacity", str(config["capacity"]),
+               "--history-store-mib", str(config["store_bytes"] // 1024**2),
+               "--history-min-frame-tokens", str(config["min_frame_tokens"])]
+              if config["history_compression"] == "budget_pool" else []),
+            *(["--stream-include-end"] if config["stream_include_end"] else [])]
 
 
 def environment(args, shard):
@@ -420,6 +437,8 @@ def build_parser():
     parser.add_argument("--state-history-budgets", type=int, nargs="+",
                         default=DEFAULT_STATE_HISTORY_BUDGETS, metavar="TOKENS",
                         help="Strictly increasing positive historical visual-token budgets after the recent-only probe")
+    parser.add_argument("--memory-layout", choices=("progressive", "full_context"), default="progressive",
+                        help="full_context: budget-pooled history sized to the context, end-inclusive stream")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser

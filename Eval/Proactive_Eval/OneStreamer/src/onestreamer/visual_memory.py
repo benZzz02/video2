@@ -62,8 +62,12 @@ import time
 from typing import Any
 
 
-VERSION = "visual_memory_v6_native_state_prefix"
+VERSION = "visual_memory_v7_context_budget_pool"
 DEFAULT_CONTEXT_TOKENS = 32768
+POOLED_COMPRESSIONS = frozenset({"avg_pool", "progressive_pool", "budget_pool"})
+# Safety margin for the per-stream history budget; the fill reader still
+# measures the exact prompt and drops records if this estimate is exceeded.
+HISTORY_BUDGET_MARGIN_TOKENS = 64
 STATE_TOKENS = ("</Response>", "</Standby>", "</Silence>")
 STATE_PROMPT_VERSION = "native_response_prefix_v3"
 STATE_SYSTEM_PROMPT = (
@@ -141,6 +145,9 @@ class MemoryConfig:
     recent_frames: int = 16
     state_history_budgets: tuple[int, ...] = (1024, 4096, 16384)
     answer_prompt: str = "standard"
+    store_budget: str = "fixed"
+    min_frame_tokens: int = 16
+    stream_include_end: bool = False
 
     def __post_init__(self):
         for name in ("capacity", "store_tokens", "store_bytes", "read_frames", "read_tokens"):
@@ -165,16 +172,26 @@ class MemoryConfig:
                 not isinstance(self.context_tokens, int) or isinstance(self.context_tokens, bool)
                 or self.context_tokens <= 0):
             raise ValueError("context_tokens must be a positive integer")
-        if self.history_compression not in {"resize", "avg_pool", "progressive_pool"}:
+        if self.history_compression not in {"resize", "avg_pool", "progressive_pool", "budget_pool"}:
             raise ValueError("Unknown history_compression mode")
         if not isinstance(self.pool_stride, int) or isinstance(self.pool_stride, bool) or self.pool_stride < 1:
             raise ValueError("pool_stride must be a positive integer")
-        if self.history_compression in {"avg_pool", "progressive_pool"} and self.history_fps != 1.0:
+        if self.history_compression in POOLED_COMPRESSIONS and self.history_fps != 1.0:
             raise ValueError("Feature pooling uses a shared 1-fps stream for recent frames and history")
         if not math.isfinite(self.pool_age_seconds) or self.pool_age_seconds <= 0:
             raise ValueError("pool_age_seconds must be finite and positive")
-        if self.history_compression == "progressive_pool" and self.pool_stride < 2:
-            raise ValueError("Progressive pooling requires pool_stride >= 2")
+        if self.history_compression in {"progressive_pool", "budget_pool"} and self.pool_stride < 2:
+            raise ValueError("Progressive and budget pooling require pool_stride >= 2")
+        if self.store_budget not in {"fixed", "context"}:
+            raise ValueError("store_budget must be fixed or context")
+        if self.store_budget == "context" and (
+                self.history_compression != "budget_pool" or self.context_tokens is None):
+            raise ValueError("store_budget=context requires budget_pool and an explicit context_tokens cap")
+        if (not isinstance(self.min_frame_tokens, int) or isinstance(self.min_frame_tokens, bool)
+                or self.min_frame_tokens < 1):
+            raise ValueError("min_frame_tokens must be a positive integer")
+        if not isinstance(self.stream_include_end, bool):
+            raise ValueError("stream_include_end must be a boolean")
         if (not isinstance(self.recent_frames, int) or isinstance(self.recent_frames, bool)
                 or self.recent_frames <= 0):
             raise ValueError("recent_frames must be a positive integer")
@@ -476,6 +493,147 @@ class ProgressiveVisualMemoryBank:
                     dropped_oldest=self._dropped, pool_operations=self._operations,
                     pool_input_tokens=self._pool_input_tokens, pool_output_tokens=self._pool_output_tokens,
                     pending_pool_events=len(self._due))
+
+
+class BudgetVisualMemoryBank:
+    """Keep every retired observation; coarsen under budget pressure before dropping.
+
+    A record costs its visual tokens plus a fixed per-image prompt overhead.
+    While over budget, the oldest record among those with the most tokens is
+    pooled one more stride, so resolution never increases with age. Records
+    stop at ``min_frame_tokens`` (one further pooling may land below it). Only
+    when every record is at that floor is a record dropped: the interior one
+    whose removal leaves the smallest temporal gap, i.e. uniform thinning that
+    keeps the earliest observation. The token budget may be set per stream.
+    """
+
+    def __init__(self, config: MemoryConfig, merge_size: int = 2):
+        if config.pool_stride < 2:
+            raise ValueError("Budget pooling requires pool_stride >= 2")
+        self.config, self.merge_size = config, merge_size
+        self.token_budget = config.store_tokens
+        self.frame_overhead = 0
+        self._records = []
+        self._last_timestamp = -math.inf
+        self._seen = self._tokens = self._bytes = 0
+        self._dropped = self._oversize = self._operations = 0
+        self._pool_input_tokens = self._pool_output_tokens = 0
+
+    def set_budget(self, tokens: int, frame_overhead: int = 0):
+        for name, value in (("tokens", tokens), ("frame_overhead", frame_overhead)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"History budget {name} must be a nonnegative integer")
+        self.token_budget, self.frame_overhead = tokens, frame_overhead
+        self._enforce()
+
+    def _pool(self, frame):
+        pooled = pool_visual_frame(frame, self.config.pool_stride, self.merge_size)
+        self._operations += int(pooled.token_count < frame.token_count)
+        self._pool_input_tokens += frame.token_count
+        self._pool_output_tokens += pooled.token_count
+        return pooled
+
+    def _cost(self):
+        return self._tokens + self.frame_overhead * len(self._records)
+
+    def _over(self):
+        cfg = self.config
+        return (len(self._records) > cfg.capacity or self._cost() > self.token_budget
+                or self._bytes > cfg.store_bytes)
+
+    def _remove(self, index):
+        dropped = self._records.pop(index)
+        self._tokens -= dropped.token_count
+        self._bytes -= dropped.nbytes
+        self._dropped += 1
+
+    def _enforce(self):
+        floor = self.config.min_frame_tokens
+        while self._records and self._over():
+            target = None
+            for index, frame in enumerate(self._records):
+                # Strict comparison keeps the oldest record among equal sizes.
+                if frame.token_count > max(floor, 1) and (
+                        target is None or frame.token_count > self._records[target].token_count):
+                    target = index
+            if target is not None:
+                old = self._records[target]
+                pooled = self._pool(old)
+                if pooled.token_count >= old.token_count:
+                    raise RuntimeError("Budget pooling must reduce tokens")
+                self._tokens += pooled.token_count - old.token_count
+                self._bytes += pooled.nbytes - old.nbytes
+                self._records[target] = pooled
+                continue
+            times = [frame.timestamp for frame in self._records]
+            if len(times) <= 2:
+                self._remove(0)
+                continue
+            self._remove(min(range(1, len(times) - 1), key=lambda i: (times[i + 1] - times[i - 1], i)))
+
+    def observe(self, frame: VisualFrame, now: float | None = None):
+        if not math.isfinite(frame.timestamp) or frame.timestamp <= self._last_timestamp:
+            raise ValueError("Archived timestamps must be finite and strictly increasing")
+        self._last_timestamp = frame.timestamp
+        self._seen += 1
+        cfg = self.config
+        if not cfg.capacity:
+            return
+        pooled = self._pool(frame)
+        if pooled.token_count + self.frame_overhead > self.token_budget or pooled.nbytes > cfg.store_bytes:
+            self._oversize += 1
+            return
+        self._records.append(pooled)
+        self._tokens += pooled.token_count
+        self._bytes += pooled.nbytes
+        self._enforce()
+
+    def candidates(self, before: float):
+        if not math.isfinite(before):
+            raise ValueError("History cutoff must be finite")
+        return [frame for frame in self._records if frame.timestamp < before]
+
+    read = VisualMemoryBank.read
+
+    def stats(self):
+        tokens = [frame.token_count for frame in self._records]
+        return dict(seen=self._seen, stored_frames=len(self._records), stored_tokens=self._tokens,
+                    stored_bytes=self._bytes, skipped_oversize=self._oversize,
+                    dropped_frames=self._dropped, pool_operations=self._operations,
+                    pool_input_tokens=self._pool_input_tokens, pool_output_tokens=self._pool_output_tokens,
+                    token_budget=self.token_budget, frame_overhead=self.frame_overhead,
+                    budget_cost=self._cost(),
+                    earliest_timestamp=self._records[0].timestamp if self._records else None,
+                    frame_tokens_min=min(tokens, default=0), frame_tokens_max=max(tokens, default=0))
+
+
+def context_history_budget(adapter, native_tokens, prompts, recent_frames, answer_reserve,
+                           context_tokens):
+    """Visual-token budget left for history after recent frames and the longest prompt.
+
+    Uses one-token placeholder frames with late timestamps, so timestamp text is
+    not underestimated. Returns (budget, per-image text overhead).
+    """
+    import torch
+
+    def dummy(timestamp):
+        return VisualFrame(float(timestamp), (1, 2, 2), torch.empty(1, 1), (), (28, 28))
+
+    if not prompts:
+        raise ValueError("A stream needs at least one question")
+    one, two = [dummy(99990)], [dummy(99990), dummy(99991)]
+    overhead = 0
+    fixed = 0
+    for question, kwargs in prompts:
+        single = adapter.count_input_tokens([], one, question, **kwargs)
+        double = adapter.count_input_tokens([], two, question, **kwargs)
+        # Frame-ID history IDs can be longer than recent IDs; pad per image.
+        overhead = max(overhead, double - single - 1 + 2)
+        fixed = max(fixed, single - 1)
+    limit = adapter.context_limit(context_tokens)
+    recent = recent_frames * (native_tokens + overhead)
+    budget = limit - answer_reserve - fixed - recent - HISTORY_BUDGET_MARGIN_TOKENS
+    return max(0, budget), overhead
 
 
 def _engine_lock(engine):
@@ -949,10 +1107,11 @@ class NativeFeatureAdapter:
 class StreamSampler:
     """Persistent decoder with a fixed origin; never prefetches beyond a cutoff."""
 
-    def __init__(self, path, start, fps):
+    def __init__(self, path, start, fps, include_end=False):
         import cv2
 
         self._cv2 = cv2
+        self.include_end = include_end
         self.capture = cv2.VideoCapture(str(path))
         if not self.capture.isOpened():
             self.capture.release()
@@ -981,9 +1140,19 @@ class StreamSampler:
         if not math.isfinite(end) or end < self.cutoff:
             raise ValueError("Cannot move a stream cutoff backwards")
         self.cutoff = end
-        while self.origin + self.slot / self.fps < min(end, self.total_frames / self.source_fps):
+        duration = self.total_frames / self.source_fps
+        while True:
             scheduled = self.origin + self.slot / self.fps
+            if scheduled >= duration or (scheduled > end if self.include_end else scheduled >= end):
+                break
             index = math.floor(scheduled * self.source_fps)
+            if self.include_end:
+                # A slot at the cutoff takes the last source frame strictly
+                # before it, as the official end-aligned recent reader does.
+                cap = math.ceil(end * self.source_fps) - 1
+                if index > cap and cap < self.current:
+                    break  # No unread frame precedes the cutoff; keep the slot.
+                index = min(index, cap)
             self.slot += 1
             if index == self.last_sample:
                 continue
@@ -1054,13 +1223,19 @@ def infer(job, rows, config=None, engine=None):
         groups.setdefault((str(path), sample.start), []).append((sample, row))
     for (path, origin), items in sorted(groups.items()):
         progressive = config.history_compression == "progressive_pool"
+        budget_pool = config.history_compression == "budget_pool"
         bank = (ProgressiveVisualMemoryBank(config, engine.model.config.vision_config.spatial_merge_size)
-                if progressive else VisualMemoryBank(config))
-        pooled_stream = config.history_compression in {"avg_pool", "progressive_pool"}
+                if progressive else
+                BudgetVisualMemoryBank(config, engine.model.config.vision_config.spatial_merge_size)
+                if budget_pool else VisualMemoryBank(config))
+        # Size the bank from the first native frame, before any FIFO retirement.
+        budget_pending = budget_pool and config.store_budget == "context" and config.enabled
+        pooled_stream = config.history_compression in POOLED_COMPRESSIONS
         window = RecentFeatureWindow(capacity=config.recent_frames) if pooled_stream else None
         # The pooling-mode recent-only control uses the identical causal stream
         # and full-resolution FIFO, even when historical storage is disabled.
-        sampler = StreamSampler(path, origin, config.history_fps) if config.enabled or pooled_stream else None
+        sampler = (StreamSampler(path, origin, config.history_fps, include_end=config.stream_include_end)
+                   if config.enabled or pooled_stream else None)
         observation_total = 0.0
         encoded_frames = 0
         pooled_input_tokens = pooled_output_tokens = 0
@@ -1074,9 +1249,20 @@ def infer(job, rows, config=None, engine=None):
                             bank.advance(sampler.observation_time)
                         if pooled_stream:
                             native = adapter.encode([frame], store_on_cpu=False)[0]
+                            if budget_pending:
+                                prompts = [(build_question_text(s), dict(
+                                    direct=s.eval_mode != "mcq_letter",
+                                    **({} if frame_evidence is None else dict(
+                                        answer_prompt=config.answer_prompt, eval_mode=s.eval_mode,
+                                        history_indices={}))))
+                                           for s, _ in items]
+                                bank.set_budget(*context_history_budget(
+                                    adapter, native.token_count, prompts, config.recent_frames,
+                                    answer_tokens, config.context_tokens))
+                                budget_pending = False
                             retired = window.observe(native)
                             if retired is not None and config.enabled:
-                                if progressive:
+                                if progressive or budget_pool:
                                     bank.observe(retired, now=sampler.observation_time)
                                 else:
                                     compressed = pool_visual_frame(
@@ -1094,6 +1280,7 @@ def infer(job, rows, config=None, engine=None):
                         encoded_frames += 1
                 if progressive and config.enabled:
                     bank.advance(sample.end)
+                if (progressive or budget_pool) and config.enabled:
                     progressive_stats = bank.stats()
                     pooled_input_tokens = progressive_stats["pool_input_tokens"]
                     pooled_output_tokens = progressive_stats["pool_output_tokens"]
@@ -1256,8 +1443,18 @@ def main(argv=None):
                         help="Total context cap including answer reserve; default: 32768 (32K)")
     parser.add_argument("--history-fps", type=float, default=1.0)
     parser.add_argument("--history-max-pixels", type=int, default=262144)
-    parser.add_argument("--history-compression", choices=("resize", "avg_pool", "progressive_pool"), default="resize",
-                        help="progressive_pool repeatedly compresses aged frames; avg_pool compresses once on FIFO eviction")
+    parser.add_argument("--history-compression", choices=("resize", "avg_pool", "progressive_pool", "budget_pool"),
+                        default="resize",
+                        help="progressive_pool repeatedly compresses aged frames; avg_pool compresses once on FIFO "
+                             "eviction; budget_pool coarsens the oldest finest records only under budget pressure")
+    parser.add_argument("--history-store-budget", choices=("fixed", "context"), default="fixed",
+                        help="context sizes the budget_pool bank per stream to the context left after recent "
+                             "frames, the longest question prompt and the answer reserve")
+    parser.add_argument("--history-min-frame-tokens", type=int, default=16,
+                        help="budget_pool stops spatial pooling at this size, then thins records uniformly in time")
+    parser.add_argument("--stream-include-end", action="store_true",
+                        help="Sample the slot at the question time using the last source frame before it, "
+                             "matching the official end-aligned final recent frame")
     parser.add_argument("--history-pool-stride", type=int, default=2,
                         help="Spatial pooling stride per axis; 2 gives about 4x fewer historical tokens")
     parser.add_argument("--history-pool-age-seconds", type=float, default=60.0,
@@ -1278,7 +1475,8 @@ def main(argv=None):
         parser.error("--history-store-mib must be finite and nonnegative")
     capacity = args.history_capacity
     if capacity is None:
-        capacity = args.history_store_tokens if args.history_compression == "progressive_pool" else 64
+        capacity = (args.history_store_tokens if args.history_compression in {"progressive_pool", "budget_pool"}
+                    else 64)
     config = MemoryConfig(
         capacity=capacity, store_tokens=args.history_store_tokens,
         store_bytes=int(args.history_store_mib * 1024**2), read_frames=args.history_read_frames,
@@ -1287,7 +1485,9 @@ def main(argv=None):
         read_mode=args.history_read_mode, context_tokens=args.context_tokens,
         history_compression=args.history_compression, pool_stride=args.history_pool_stride,
         pool_age_seconds=args.history_pool_age_seconds, recent_frames=args.recent_frames,
-        state_history_budgets=tuple(args.state_history_budgets), answer_prompt=args.answer_prompt)
+        state_history_budgets=tuple(args.state_history_budgets), answer_prompt=args.answer_prompt,
+        store_budget=args.history_store_budget, min_frame_tokens=args.history_min_frame_tokens,
+        stream_include_end=args.stream_include_end)
     if config.answer_prompt == "frame_id_witness":
         from onestreamer.frame_evidence import ANSWER_RESERVE_TOKENS, PROMPT_VERSION
         answer_tokens, recent_prompt = ANSWER_RESERVE_TOKENS, PROMPT_VERSION
@@ -1328,20 +1528,24 @@ def main(argv=None):
     job = dict(model=original.get("model", Path(model_path).name), model_path=model_path,
                device=args.device, dtype=args.dtype, attn_implementation=args.attn_implementation,
                video_root=str(args.video_root or original.get("video_root", ".")))
-    pooled_stream = config.history_compression in {"avg_pool", "progressive_pool"}
+    pooled_stream = config.history_compression in POOLED_COMPRESSIONS
     progressive = config.history_compression == "progressive_pool"
+    budget_pool = config.history_compression == "budget_pool"
     manifest = dict(version=VERSION, config=asdict(config), job=job, samples=rows,
                     source_manifest=str((args.manifest or args.samples).resolve()),
                     protocol=dict(recent_frames=config.recent_frames, recent_fps=1.0,
                                   answer_tokens=answer_tokens,
                                   answer_prompt=config.answer_prompt,
-                                  caption_generation=False, history_sampling="fixed_origin_causal",
+                                  caption_generation=False, history_sampling=("fixed_origin_causal_end_inclusive"
+                                                    if config.stream_include_end else "fixed_origin_causal"),
                                   history_storage=("pooled_native_features_with_deepstack" if pooled_stream
                                                    else "native_full_image_features_with_deepstack"),
                                   history_write=("on_recent_fifo_eviction_then_age_pool" if progressive else
+                                                 "on_recent_fifo_eviction_then_budget_pool" if budget_pool else
                                                  "on_recent_fifo_eviction" if pooled_stream
                                                  else "on_observation"),
                                   history_selection=("age_pool_then_drop_oldest_at_caps" if progressive
+                                                     else "coarsen_oldest_finest_then_uniform_thin" if budget_pool
                                                      else "seeded_priority_reservoir"),
                                   read_selection=("native_state_progressive_visual_read" if config.read_mode == "state" else
                                                   "explicit_action_progressive_visual_read" if config.read_mode == "action" else
