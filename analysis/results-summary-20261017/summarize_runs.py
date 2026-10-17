@@ -22,6 +22,7 @@ RUNS = [
     ("Frame-ID witness (as scored)", HERE / "frame-id-witness-20261014.jsonl.gz"),
     ("Frame-ID witness (official parser)", HERE / "frame-id-witness-20261014.jsonl.gz"),
     ("Full-context budget_pool v2", HERE / "full-context-v2-20261015.jsonl.gz"),
+    ("Routed: question router + Recent16 visual check", HERE / "routed-vcheck-20261017.jsonl.gz"),
 ]
 
 
