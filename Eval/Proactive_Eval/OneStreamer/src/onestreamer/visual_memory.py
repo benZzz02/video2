@@ -161,8 +161,8 @@ class MemoryConfig:
             raise ValueError("history_fps must be finite and positive")
         if self.history_max_pixels < 1024:
             raise ValueError("history_max_pixels must be at least 1024")
-        if self.read_mode not in {"fixed", "fill", "state", "action", "routed", "views"}:
-            raise ValueError("read_mode must be fixed, fill, state, action, routed or views")
+        if self.read_mode not in {"fixed", "fill", "state", "action", "routed"}:
+            raise ValueError("read_mode must be fixed, fill, state, action or routed")
         if not (isinstance(self.route_threshold, (int, float)) and 0.0 <= self.route_threshold <= 1.0):
             raise ValueError("route_threshold must be a probability")
         if self.route_escalation not in {"SHORT", "LONG"}:
@@ -209,7 +209,7 @@ class MemoryConfig:
     @property
     def enabled(self):
         return all((self.capacity, self.store_tokens, self.store_bytes)) and (
-            self.read_mode in {"fill", "state", "action", "routed", "views"} or all((self.read_frames, self.read_tokens)))
+            self.read_mode in {"fill", "state", "action", "routed"} or all((self.read_frames, self.read_tokens)))
 
 
 @dataclass(frozen=True)
@@ -1359,7 +1359,7 @@ def infer(job, rows, config=None, engine=None):
                         query_time=sample.end, stream_start=origin, direct=direct,
                         history_budgets=config.state_history_budgets,
                         max_tokens=16, context_tokens=config.context_tokens)
-                elif config.read_mode in {"fill", "views"}:
+                elif config.read_mode == "fill":
                     candidates = bank.candidates(before=recent[0].timestamp)
                     if frame_evidence is not None:
                         history_indices = {f.timestamp: i for i, f in enumerate(candidates)}
@@ -1397,26 +1397,6 @@ def infer(job, rows, config=None, engine=None):
                 elif routed_answer is not None:
                     prediction, metrics = routed_answer
                     evidence_fields = {}
-                elif config.read_mode == "views":
-                    from onestreamer import two_views
-                    cands = two_views.candidates(sample)
-                    ids = two_views.candidate_token_ids(engine.processor.tokenizer, cands)
-                    with two_views.FirstTokenCapture(engine) as capture:
-                        memory_text, metrics = adapter.answer(
-                            history, recent, question, direct=direct, max_tokens=answer_tokens,
-                            context_tokens=config.context_tokens)
-                    memory_dist, memory_mass = two_views.distribution(capture.scores, ids)
-                    present_text, present_logits, present_metrics, _ = two_views.present_view(
-                        engine, sample, row["media"], question)
-                    present_dist, present_mass = two_views.distribution(present_logits, ids)
-                    prediction, product = two_views.combine(present_dist, memory_dist)
-                    evidence_fields = dict(two_views=dict(
-                        present_text=present_text, memory_text=memory_text,
-                        present_hit=score_prediction(sample, present_text)[1],
-                        memory_hit=score_prediction(sample, memory_text)[1],
-                        present_dist=present_dist, memory_dist=memory_dist,
-                        present_candidate_mass=present_mass, memory_candidate_mass=memory_mass,
-                        log_product=product, present_input_tokens=present_metrics["input_tokens"]))
                 else:
                     prediction, metrics = adapter.answer(
                         history, recent, question, direct=direct, max_tokens=answer_tokens,
@@ -1507,7 +1487,7 @@ def main(argv=None):
                         help="routed: NOW questions whose Recent16 first-token probability is below this read history")
     parser.add_argument("--route-escalation", choices=("SHORT", "LONG"), default="SHORT")
     parser.add_argument("--short-history-tokens", type=int, default=16384)
-    parser.add_argument("--history-read-mode", choices=("fixed", "fill", "state", "action", "routed", "views"), default="fixed",
+    parser.add_argument("--history-read-mode", choices=("fixed", "fill", "state", "action", "routed"), default="fixed",
                         help="fill fills context; state uses native readiness; action requests history with A/B actions")
     parser.add_argument("--answer-prompt", choices=("standard", "frame_id_witness"),
                         default="standard", help="Exploratory frame-ID witness answer requires --history-read-mode fill")
@@ -1625,7 +1605,6 @@ def main(argv=None):
                                   read_selection=("native_state_progressive_visual_read" if config.read_mode == "state" else
                                                   "explicit_action_progressive_visual_read" if config.read_mode == "action" else
                                                   "question_routed_recent16_or_history" if config.read_mode == "routed" else
-                                                  "present_memory_product_of_experts" if config.read_mode == "views" else
                                                   "temporal_spread_context_fill" if config.read_mode == "fill"
                                                   else "uniform_temporal"),
                                   recent_replay=("fixed_origin_fifo_cached_features" if pooled_stream
@@ -1665,8 +1644,6 @@ def main(argv=None):
         source_paths.append(Path(__file__).with_name("frame_evidence.py"))
     if config.read_mode == "routed":
         source_paths.append(Path(__file__).with_name("question_router.py"))
-    if config.read_mode == "views":
-        source_paths.append(Path(__file__).with_name("two_views.py"))
     manifest["source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                 for path in source_paths}
     fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()

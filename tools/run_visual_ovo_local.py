@@ -81,7 +81,7 @@ def source_hashes():
         ["git", "ls-files", "-z", "Eval", "run_visual_memory.sh"], cwd=ROOT).decode().split("\0")
     sources = {name: file_sha(ROOT / name) for name in tracked if name and (ROOT / name).is_file()}
     # New local modules must participate in resume identity before a git add.
-    for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py", "two_views.py"):
+    for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py"):
         controller = "Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
         sources[controller] = file_sha(ROOT / controller)
     sources["tools/run_visual_ovo_local.py"] = file_sha(Path(__file__).resolve())
@@ -437,7 +437,7 @@ def build_parser():
     parser.add_argument("--python", default=os.environ.get("EVAL_PYTHON", DEFAULT_PYTHON))
     parser.add_argument("--route-threshold", type=float, default=0.0)
     parser.add_argument("--route-escalation", choices=("SHORT", "LONG"), default="SHORT")
-    parser.add_argument("--history-read-mode", choices=("fill", "state", "action", "routed", "views"), default="fill",
+    parser.add_argument("--history-read-mode", choices=("fill", "state", "action", "routed"), default="fill",
                         help="Fill context, use native response states, or explicitly decide whether to read more history")
     parser.add_argument("--answer-prompt", choices=("standard", "frame_id_witness"), default="standard",
                         help="Final-answer prompt: original QA or experimental frame-ID witness")
