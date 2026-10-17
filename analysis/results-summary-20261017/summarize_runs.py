@@ -49,7 +49,7 @@ for name, path in RUNS:
     g = {k: sum(acc[s] for s in GROUP if GROUP[s] == k) / sum(GROUP[s] == k for s in GROUP) for k in ("BT", "RT", "FT")}
     table.append(dict(run=name, source="predictions/" + path.name, overall=sum(g.values()) / 3, **g, subtasks=acc))
 
-json.dump(table, open("full_run_scores.json", "w"), indent=1)
+json.dump(table, open(Path(__file__).resolve().parent / "full_run_scores.json", "w"), indent=1)
 print("| Run | Overall | BT | RT | FT |\n|---|---:|---:|---:|---:|")
 for t in table:
     print(f"| {t['run']} | {t['overall']:.2f} | {t['BT']:.2f} | {t['RT']:.2f} | {t['FT']:.2f} |")
