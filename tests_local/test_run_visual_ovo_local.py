@@ -60,7 +60,7 @@ class PureTests(unittest.TestCase):
 
     def test_untracked_controller_is_in_source_identity(self):
         names = ["Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
-                 for name in ("state_readout.py", "action_readout.py", "frame_evidence.py")]
+                 for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py")]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in names:

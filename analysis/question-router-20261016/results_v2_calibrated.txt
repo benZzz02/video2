@@ -1,0 +1,34 @@
+content-free logprobs: {'NOW': -0.54, 'SHORT': -1.96, 'LONG': -1.42} | calibrate: True
+label distribution per subtask (NOW/SHORT/LONG):
+  EPM:   65  130  102
+  HLD:   38   87   61
+  ASI:    0   76   72
+  STU:  100   34   44
+  OJR:  143   22   19
+  ATR:   77    9   30
+  FPD:   96    3    2
+  ACR:   89   17    3
+  OCR:  118    2   29
+  CRR:  240    0    0
+  SSR:  175  288  166
+  REC:    0    0  698
+
+ALL (n=3035)
+  Recent16  BT 75.20 RT 83.28 FT 53.10 Overall 70.53
+  oldFill   BT 78.01 RT 79.47 FT 62.12 Overall 73.20
+  fullctx   BT 78.01 RT 79.81 FT 61.66 Overall 73.16
+  router    BT 78.13 RT 82.91 FT 57.63 Overall 72.89
+
+half0 (n=1545)
+  Recent16  BT 74.64 RT 83.23 FT 54.84 Overall 70.90
+  oldFill   BT 76.87 RT 80.05 FT 64.12 Overall 73.68
+  fullctx   BT 77.00 RT 80.95 FT 64.43 Overall 74.13
+  router    BT 76.39 RT 83.37 FT 59.13 Overall 72.96
+
+half1 (n=1490)
+  Recent16  BT 75.82 RT 83.03 FT 51.34 Overall 70.06
+  oldFill   BT 79.14 RT 78.57 FT 60.10 Overall 72.61
+  fullctx   BT 78.98 RT 78.30 FT 58.80 Overall 72.03
+  router    BT 79.84 RT 82.10 FT 56.08 Overall 72.68
+
+router per subtask: {'EPM': 65.3, 'HLD': 99.5, 'ASI': 69.6, 'STU': 71.9, 'OJR': 82.1, 'ATR': 82.8, 'FPD': 79.2, 'ACR': 86.2, 'OCR': 95.3, 'CRR': 52.5, 'SSR': 81.6, 'REC': 38.8}

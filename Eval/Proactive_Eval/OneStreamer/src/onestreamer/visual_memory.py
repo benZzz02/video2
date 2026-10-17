@@ -148,6 +148,9 @@ class MemoryConfig:
     store_budget: str = "fixed"
     min_frame_tokens: int = 16
     stream_include_end: bool = False
+    route_threshold: float = 0.0
+    route_escalation: str = "SHORT"
+    short_history_tokens: int = 16384
 
     def __post_init__(self):
         for name in ("capacity", "store_tokens", "store_bytes", "read_frames", "read_tokens"):
@@ -158,8 +161,15 @@ class MemoryConfig:
             raise ValueError("history_fps must be finite and positive")
         if self.history_max_pixels < 1024:
             raise ValueError("history_max_pixels must be at least 1024")
-        if self.read_mode not in {"fixed", "fill", "state", "action"}:
-            raise ValueError("read_mode must be fixed, fill, state or action")
+        if self.read_mode not in {"fixed", "fill", "state", "action", "routed"}:
+            raise ValueError("read_mode must be fixed, fill, state, action or routed")
+        if not (isinstance(self.route_threshold, (int, float)) and 0.0 <= self.route_threshold <= 1.0):
+            raise ValueError("route_threshold must be a probability")
+        if self.route_escalation not in {"SHORT", "LONG"}:
+            raise ValueError("route_escalation must be SHORT or LONG")
+        if (not isinstance(self.short_history_tokens, int) or isinstance(self.short_history_tokens, bool)
+                or self.short_history_tokens <= 0):
+            raise ValueError("short_history_tokens must be a positive integer")
         if self.answer_prompt not in {"standard", "frame_id_witness"}:
             raise ValueError("answer_prompt must be standard or frame_id_witness")
         if self.answer_prompt == "frame_id_witness" and self.read_mode != "fill":
@@ -199,7 +209,7 @@ class MemoryConfig:
     @property
     def enabled(self):
         return all((self.capacity, self.store_tokens, self.store_bytes)) and (
-            self.read_mode in {"fill", "state", "action"} or all((self.read_frames, self.read_tokens)))
+            self.read_mode in {"fill", "state", "action", "routed"} or all((self.read_frames, self.read_tokens)))
 
 
 @dataclass(frozen=True)
@@ -1219,6 +1229,10 @@ def infer(job, rows, config=None, engine=None):
         adapter.state_token_ids()
     elif config.read_mode == "action":
         adapter.read_action_token_ids()
+    router = None
+    if config.read_mode == "routed":
+        from onestreamer import question_router
+        router = question_router.QuestionRouter(engine)
     groups = {}
     for row in rows:
         sample = Sample.from_dict(row)
@@ -1305,7 +1319,34 @@ def infer(job, rows, config=None, engine=None):
                 direct = sample.eval_mode != "mcq_letter"
                 selection_meta = {}
                 history_indices = None
-                if config.read_mode == "state":
+                routed_answer = None
+                if config.read_mode == "routed":
+                    # The question is known only now; memory writing above never saw it.
+                    route = router.route(sample.question)
+                    final_scope = route["label"]
+                    if final_scope == "NOW":
+                        now_prediction, now_metrics, confidence, now_frames = question_router.official_recent_answer(
+                            engine, sample, row["media"], question)
+                        route["recent_confidence"] = confidence
+                        if confidence >= config.route_threshold:
+                            routed_answer = (now_prediction, now_metrics)
+                            recent_sizes = [list(image.size) for _, image in now_frames]
+                            routed_recent_timestamps = [t for t, _ in now_frames]
+                        else:
+                            final_scope = config.route_escalation
+                    route["final_scope"] = final_scope
+                    selection_meta = dict(route=route)
+                    if routed_answer is not None:
+                        history = []
+                    else:
+                        candidates = bank.candidates(before=recent[0].timestamp)
+                        if final_scope == "SHORT":
+                            candidates = question_router.newest_history(candidates, config.short_history_tokens)
+                        history, fill_meta = adapter.select_history(
+                            candidates, recent, question, direct=direct,
+                            max_tokens=answer_tokens, context_tokens=config.context_tokens)
+                        selection_meta.update(fill_meta)
+                elif config.read_mode == "state":
                     from onestreamer.state_readout import run_state_readout
                     history, selection_meta = run_state_readout(
                         adapter, bank.candidates(before=recent[0].timestamp), recent, question,
@@ -1353,6 +1394,9 @@ def infer(job, rows, config=None, engine=None):
                                          frame_map=specs, **witness)
                     evidence_fields = dict(raw_prediction=raw_prediction,
                                            frame_evidence=evidence_meta)
+                elif routed_answer is not None:
+                    prediction, metrics = routed_answer
+                    evidence_fields = {}
                 else:
                     prediction, metrics = adapter.answer(
                         history, recent, question, direct=direct, max_tokens=answer_tokens,
@@ -1381,10 +1425,13 @@ def infer(job, rows, config=None, engine=None):
                            action_rounds=selection_meta.get("action_rounds", []),
                            action_stop_reason=selection_meta.get("action_stop_reason"),
                            action_invalid_count=selection_meta.get("action_invalid_count", 0),
-                           recent_timestamps=[f.timestamp for f in recent],
+                           recent_timestamps=(routed_recent_timestamps if routed_answer is not None
+                                              else [f.timestamp for f in recent]),
+                           route=selection_meta.get("route"),
                            recent_frames=config.recent_frames, recent_read_frames=len(recent),
                            recent_image_sizes=recent_sizes,
-                           recent_sampling=("fixed_origin_fifo" if pooled_stream else "official_end_aligned"),
+                           recent_sampling=("official_end_aligned" if routed_answer is not None or not pooled_stream
+                                            else "fixed_origin_fifo"),
                            stream_encoded_frames_cumulative=encoded_frames,
                            pooled_input_tokens_cumulative=pooled_input_tokens,
                            pooled_output_tokens_cumulative=pooled_output_tokens,
@@ -1436,7 +1483,11 @@ def main(argv=None):
     parser.add_argument("--history-store-mib", type=float, default=512)
     parser.add_argument("--history-read-frames", type=int, default=4)
     parser.add_argument("--history-read-tokens", type=int, default=1024)
-    parser.add_argument("--history-read-mode", choices=("fixed", "fill", "state", "action"), default="fixed",
+    parser.add_argument("--route-threshold", type=float, default=0.0,
+                        help="routed: NOW questions whose Recent16 first-token probability is below this read history")
+    parser.add_argument("--route-escalation", choices=("SHORT", "LONG"), default="SHORT")
+    parser.add_argument("--short-history-tokens", type=int, default=16384)
+    parser.add_argument("--history-read-mode", choices=("fixed", "fill", "state", "action", "routed"), default="fixed",
                         help="fill fills context; state uses native readiness; action requests history with A/B actions")
     parser.add_argument("--answer-prompt", choices=("standard", "frame_id_witness"),
                         default="standard", help="Exploratory frame-ID witness answer requires --history-read-mode fill")
@@ -1490,7 +1541,8 @@ def main(argv=None):
         pool_age_seconds=args.history_pool_age_seconds, recent_frames=args.recent_frames,
         state_history_budgets=tuple(args.state_history_budgets), answer_prompt=args.answer_prompt,
         store_budget=args.history_store_budget, min_frame_tokens=args.history_min_frame_tokens,
-        stream_include_end=args.stream_include_end)
+        stream_include_end=args.stream_include_end, route_threshold=args.route_threshold,
+        route_escalation=args.route_escalation, short_history_tokens=args.short_history_tokens)
     if config.answer_prompt == "frame_id_witness":
         from onestreamer.frame_evidence import ANSWER_RESERVE_TOKENS, PROMPT_VERSION
         answer_tokens, recent_prompt = ANSWER_RESERVE_TOKENS, PROMPT_VERSION
@@ -1552,6 +1604,7 @@ def main(argv=None):
                                                      else "seeded_priority_reservoir"),
                                   read_selection=("native_state_progressive_visual_read" if config.read_mode == "state" else
                                                   "explicit_action_progressive_visual_read" if config.read_mode == "action" else
+                                                  "question_routed_recent16_or_history" if config.read_mode == "routed" else
                                                   "temporal_spread_context_fill" if config.read_mode == "fill"
                                                   else "uniform_temporal"),
                                   recent_replay=("fixed_origin_fifo_cached_features" if pooled_stream
@@ -1589,6 +1642,8 @@ def main(argv=None):
         source_paths.append(Path(__file__).with_name("action_readout.py"))
     if config.answer_prompt == "frame_id_witness":
         source_paths.append(Path(__file__).with_name("frame_evidence.py"))
+    if config.read_mode == "routed":
+        source_paths.append(Path(__file__).with_name("question_router.py"))
     manifest["source_sha256"] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                 for path in source_paths}
     fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()

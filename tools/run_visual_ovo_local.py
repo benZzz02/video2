@@ -59,6 +59,8 @@ def configuration(args):
                   answer_prompt=getattr(args, "answer_prompt", "standard"),
                   state_history_budgets=tuple(getattr(
                       args, "state_history_budgets", DEFAULT_STATE_HISTORY_BUDGETS)))
+    if values["read_mode"] == "routed":
+        values.update(route_threshold=args.route_threshold, route_escalation=args.route_escalation)
     return json.loads(json.dumps(asdict(MemoryConfig(**values))))
 
 
@@ -79,7 +81,7 @@ def source_hashes():
         ["git", "ls-files", "-z", "Eval", "run_visual_memory.sh"], cwd=ROOT).decode().split("\0")
     sources = {name: file_sha(ROOT / name) for name in tracked if name and (ROOT / name).is_file()}
     # New local modules must participate in resume identity before a git add.
-    for name in ("state_readout.py", "action_readout.py", "frame_evidence.py"):
+    for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py"):
         controller = "Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
         sources[controller] = file_sha(ROOT / controller)
     sources["tools/run_visual_ovo_local.py"] = file_sha(Path(__file__).resolve())
@@ -242,7 +244,10 @@ def command(args, samples, output):
                "--history-store-mib", str(config["store_bytes"] // 1024**2),
                "--history-min-frame-tokens", str(config["min_frame_tokens"])]
               if config["history_compression"] == "budget_pool" else []),
-            *(["--stream-include-end"] if config["stream_include_end"] else [])]
+            *(["--stream-include-end"] if config["stream_include_end"] else []),
+            *(["--route-threshold", str(config["route_threshold"]), "--route-escalation",
+               config["route_escalation"], "--short-history-tokens", str(config["short_history_tokens"])]
+              if config["read_mode"] == "routed" else [])]
 
 
 def environment(args, shard):
@@ -430,7 +435,9 @@ def build_parser():
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--video-root", type=Path, default=DEFAULT_VIDEOS)
     parser.add_argument("--python", default=os.environ.get("EVAL_PYTHON", DEFAULT_PYTHON))
-    parser.add_argument("--history-read-mode", choices=("fill", "state", "action"), default="fill",
+    parser.add_argument("--route-threshold", type=float, default=0.0)
+    parser.add_argument("--route-escalation", choices=("SHORT", "LONG"), default="SHORT")
+    parser.add_argument("--history-read-mode", choices=("fill", "state", "action", "routed"), default="fill",
                         help="Fill context, use native response states, or explicitly decide whether to read more history")
     parser.add_argument("--answer-prompt", choices=("standard", "frame_id_witness"), default="standard",
                         help="Final-answer prompt: original QA or experimental frame-ID witness")
