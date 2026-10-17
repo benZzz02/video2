@@ -1,0 +1,79 @@
+{
+  "rows": 3035,
+  "metrics": [
+    {
+      "model": "OneStreamer-4B",
+      "variant": "visual_memory_v4_configurable_recent_progressive_pool_fill_r16",
+      "n": 3035,
+      "overall_accuracy": 0.7320391989170129,
+      "sample_micro_accuracy": 0.6836902800658978,
+      "task_accuracy": {
+        "backward_tracking": 0.7801489172456915,
+        "real_time_visual_perception": 0.7947433689934195,
+        "forward_active_responding": 0.6212253105119278
+      },
+      "task_subtask_accuracy": {
+        "backward_tracking": {
+          "EPM": 0.6363636363636364,
+          "HLD": 0.9946236559139785,
+          "ASI": 0.7094594594594594
+        },
+        "real_time_visual_perception": {
+          "STU": 0.6741573033707865,
+          "OJR": 0.7391304347826086,
+          "ATR": 0.8017241379310345,
+          "FPD": 0.7722772277227723,
+          "ACR": 0.8348623853211009,
+          "OCR": 0.9463087248322147
+        },
+        "forward_active_responding": {
+          "CRR": 0.6708333333333333,
+          "SSR": 0.8203497615262321,
+          "REC": 0.37249283667621774
+        }
+      },
+      "missing_subtasks": {
+        "backward_tracking": [],
+        "real_time_visual_perception": [],
+        "forward_active_responding": []
+      },
+      "aggregation": "mean_3_categories_of_mean_subtask_accuracy",
+      "context": {
+        "input_tokens": {
+          "mean": 26482.260955518945,
+          "median": 30621.0,
+          "p95": 59679.9,
+          "min": 513,
+          "max": 92943
+        },
+        "visual_tokens": {
+          "mean": 24686.32586490939,
+          "median": 29480.0,
+          "p95": 59070.0,
+          "min": 240,
+          "max": 92400
+        },
+        "text_tokens": {
+          "mean": 1795.9350906095551,
+          "median": 903.0,
+          "p95": 7149.899999999972,
+          "min": 173,
+          "max": 22307
+        },
+        "memory_tokens": {
+          "mean": 0.0,
+          "median": 0.0,
+          "p95": 0.0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      "mean_answer_seconds": 4.5741385223354705
+    }
+  ],
+  "observation_seconds": 62744.38240601728,
+  "query_seconds": 13882.510415288154,
+  "total_measured_seconds": 76626.89282130543,
+  "run_fingerprint": "d9fd45d72cdf7bfa4734d6722abf721aca469d054ee0dadf215eb00850b1f5d2",
+  "completed_at": "2026-10-11T13:55:51.905625+00:00"
+}

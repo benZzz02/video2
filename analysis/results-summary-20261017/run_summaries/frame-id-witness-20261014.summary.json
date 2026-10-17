@@ -1,0 +1,87 @@
+{
+  "rows": 3035,
+  "metrics": [
+    {
+      "model": "OneStreamer-4B",
+      "variant": "visual_memory_v6_native_state_prefix_progressive_pool_fill_r16_frame_id_witness_v2",
+      "n": 3035,
+      "overall_accuracy": 0.6014511910989818,
+      "sample_micro_accuracy": 0.5960461285008237,
+      "task_accuracy": {
+        "backward_tracking": 0.5201457567048965,
+        "real_time_visual_perception": 0.7173533673340936,
+        "forward_active_responding": 0.5668544492579551
+      },
+      "task_subtask_accuracy": {
+        "backward_tracking": {
+          "EPM": 0.5084175084175084,
+          "HLD": 0.3763440860215054,
+          "ASI": 0.6756756756756757
+        },
+        "real_time_visual_perception": {
+          "STU": 0.5955056179775281,
+          "OJR": 0.7010869565217391,
+          "ATR": 0.7413793103448276,
+          "FPD": 0.5742574257425742,
+          "ACR": 0.7522935779816514,
+          "OCR": 0.9395973154362416
+        },
+        "forward_active_responding": {
+          "CRR": 0.5333333333333333,
+          "SSR": 0.8076311605723371,
+          "REC": 0.35959885386819485
+        }
+      },
+      "missing_subtasks": {
+        "backward_tracking": [],
+        "real_time_visual_perception": [],
+        "forward_active_responding": []
+      },
+      "aggregation": "mean_3_categories_of_mean_subtask_accuracy",
+      "context": {
+        "input_tokens": {
+          "mean": 27318.87644151565,
+          "median": 31576.0,
+          "p95": 60047.9,
+          "min": 742,
+          "max": 93271
+        },
+        "visual_tokens": {
+          "mean": 24686.32586490939,
+          "median": 29480.0,
+          "p95": 59070.0,
+          "min": 240,
+          "max": 92400
+        },
+        "text_tokens": {
+          "mean": 2632.55057660626,
+          "median": 1374.0,
+          "p95": 10181.899999999956,
+          "min": 392,
+          "max": 32090
+        },
+        "memory_tokens": {
+          "mean": 0.0,
+          "median": 0.0,
+          "p95": 0.0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      "mean_answer_seconds": 5.809346349677723
+    }
+  ],
+  "observation_seconds": 103845.13320500118,
+  "query_seconds": 17631.36617127189,
+  "total_measured_seconds": 121476.49937627307,
+  "state_probe_seconds": 0.0,
+  "state_probe_count": 0,
+  "state_stop_reasons": {},
+  "action_probe_seconds": 0.0,
+  "action_probe_count": 0,
+  "action_invalid_count": 0,
+  "action_counts": {},
+  "action_stop_reasons": {},
+  "run_fingerprint": "c82cc37fd85cbbe1db012f514c22e104e2d8ebb8da51d66114a07cf9d3a03dc6",
+  "completed_at": "2026-10-15T05:27:49.380532+00:00"
+}

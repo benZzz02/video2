@@ -1,0 +1,87 @@
+{
+  "rows": 3035,
+  "metrics": [
+    {
+      "model": "OneStreamer-4B",
+      "variant": "visual_memory_v7_context_budget_pool_budget_pool_fill_r16",
+      "n": 3035,
+      "overall_accuracy": 0.7315810675828446,
+      "sample_micro_accuracy": 0.6889621087314662,
+      "task_accuracy": {
+        "backward_tracking": 0.7801034172001914,
+        "real_time_visual_perception": 0.7980845293820126,
+        "forward_active_responding": 0.6165552561663299
+      },
+      "task_subtask_accuracy": {
+        "backward_tracking": {
+          "EPM": 0.6767676767676768,
+          "HLD": 0.9946236559139785,
+          "ASI": 0.668918918918919
+        },
+        "real_time_visual_perception": {
+          "STU": 0.6910112359550562,
+          "OJR": 0.8097826086956522,
+          "ATR": 0.8017241379310345,
+          "FPD": 0.7524752475247525,
+          "ACR": 0.8073394495412844,
+          "OCR": 0.9261744966442953
+        },
+        "forward_active_responding": {
+          "CRR": 0.6458333333333334,
+          "SSR": 0.8155802861685215,
+          "REC": 0.38825214899713467
+        }
+      },
+      "missing_subtasks": {
+        "backward_tracking": [],
+        "real_time_visual_perception": [],
+        "forward_active_responding": []
+      },
+      "aggregation": "mean_3_categories_of_mean_subtask_accuracy",
+      "context": {
+        "input_tokens": {
+          "mean": 48498.78253706754,
+          "median": 36858.0,
+          "p95": 129294.5,
+          "min": 583,
+          "max": 130462
+        },
+        "visual_tokens": {
+          "mean": 45839.935420098845,
+          "median": 34640.0,
+          "p95": 125228.99999999999,
+          "min": 300,
+          "max": 129600
+        },
+        "text_tokens": {
+          "mean": 2658.8471169686986,
+          "median": 1468.0,
+          "p95": 9519.999999999984,
+          "min": 183,
+          "max": 22307
+        },
+        "memory_tokens": {
+          "mean": 0.0,
+          "median": 0.0,
+          "p95": 0.0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      "mean_answer_seconds": 13.371415584154667
+    }
+  ],
+  "observation_seconds": 88853.43755910292,
+  "query_seconds": 40582.24629790941,
+  "total_measured_seconds": 129435.68385701234,
+  "state_probe_seconds": 0.0,
+  "state_probe_count": 0,
+  "state_stop_reasons": {},
+  "action_probe_seconds": 0.0,
+  "action_probe_count": 0,
+  "action_invalid_count": 0,
+  "action_counts": {},
+  "action_stop_reasons": {},
+  "run_fingerprint": "c65de3a09b70e82055f1ed6ab7254934d87e8a2a95085e8e9367b4176e9294dc",
+  "completed_at": "2026-10-16T15:16:15.666767+00:00"
+}

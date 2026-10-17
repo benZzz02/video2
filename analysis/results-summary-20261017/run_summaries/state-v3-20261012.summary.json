@@ -1,0 +1,86 @@
+{
+  "rows": 3035,
+  "metrics": [
+    {
+      "model": "OneStreamer-4B",
+      "variant": "visual_memory_v6_native_state_prefix_progressive_pool_state_r16",
+      "n": 3035,
+      "overall_accuracy": 0.7290685242152487,
+      "sample_micro_accuracy": 0.6718286655683691,
+      "task_accuracy": {
+        "backward_tracking": 0.7767894972196047,
+        "real_time_visual_perception": 0.811784395541301,
+        "forward_active_responding": 0.5986316798848402
+      },
+      "task_subtask_accuracy": {
+        "backward_tracking": {
+          "EPM": 0.6195286195286195,
+          "HLD": 0.9946236559139785,
+          "ASI": 0.7162162162162162
+        },
+        "real_time_visual_perception": {
+          "STU": 0.7078651685393258,
+          "OJR": 0.782608695652174,
+          "ATR": 0.8017241379310345,
+          "FPD": 0.7722772277227723,
+          "ACR": 0.8532110091743119,
+          "OCR": 0.9530201342281879
+        },
+        "forward_active_responding": {
+          "CRR": 0.675,
+          "SSR": 0.8171701112877583,
+          "REC": 0.3037249283667622
+        }
+      },
+      "missing_subtasks": {
+        "backward_tracking": [],
+        "real_time_visual_perception": [],
+        "forward_active_responding": []
+      },
+      "aggregation": "mean_3_categories_of_mean_subtask_accuracy",
+      "context": {
+        "input_tokens": {
+          "mean": 20681.46161449753,
+          "median": 15313.0,
+          "p95": 49677.3,
+          "min": 513,
+          "max": 92943
+        },
+        "visual_tokens": {
+          "mean": 19502.819769357495,
+          "median": 14720.0,
+          "p95": 48960.0,
+          "min": 240,
+          "max": 92400
+        },
+        "text_tokens": {
+          "mean": 1178.641845140033,
+          "median": 411.0,
+          "p95": 5507.099999999993,
+          "min": 173,
+          "max": 22307
+        },
+        "memory_tokens": {
+          "mean": 0.0,
+          "median": 0.0,
+          "p95": 0.0,
+          "min": 0,
+          "max": 0
+        }
+      },
+      "mean_answer_seconds": 10.013628239689293
+    }
+  ],
+  "observation_seconds": 68101.51048610605,
+  "query_seconds": 30391.361707456977,
+  "total_measured_seconds": 98492.87219356326,
+  "state_probe_seconds": 20136.37090895684,
+  "state_probe_count": 6382,
+  "state_stop_reasons": {
+    "history_exhausted": 886,
+    "response": 1992,
+    "no_history": 157
+  },
+  "run_fingerprint": "171a8c786c4452763863856ad707517c445e351db5b8f517c65f2a4c6adc62c4",
+  "completed_at": "2026-10-13T03:26:21.333661+00:00"
+}
