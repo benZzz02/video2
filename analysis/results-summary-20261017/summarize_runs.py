@@ -4,33 +4,33 @@ Overall = mean over BT/RT/FT of the mean subtask accuracy (official macro).
 The frame-ID run is also rescored with the official parser on its raw output,
 because its witness parser scored answers without an "ANSWER:" line as empty.
 """
-import glob, json, re, sys
+import gzip, json, re, sys
 from pathlib import Path
 
-M = Path("/home/zhangnuohua/medhorizon")
-sys.path.insert(0, str(M / "video2-fill-full-context-20261015/Eval/Proactive_Eval/OneStreamer/src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Eval/Proactive_Eval/OneStreamer/src"))
 from onestreamer.ovobench import score_prediction
 from onestreamer.schema import Sample
 
 GROUP = {"EPM": "BT", "HLD": "BT", "ASI": "BT", "STU": "RT", "OJR": "RT", "ATR": "RT",
          "FPD": "RT", "ACR": "RT", "OCR": "RT", "CRR": "FT", "SSR": "FT", "REC": "FT"}
+HERE = Path(__file__).resolve().parent / "predictions"
 RUNS = [
-    ("Recent16 (official)", "/mnt/truenas_nfs/dataset/znh1302/OneStreamer-OVO-eval/outputs/OneStreamer-4B/ovobench/ovo-full-recent16-2gpu-20261012/recent16/ovobench/predictions.json"),
-    ("Fill (progressive_pool, 2026-10-11)", "video2/results/ovo-visual-memory-2gpu-20261011/predictions.jsonl"),
-    ("State v3", "video2-state-fix-20261012/results/ovo-state-memory-v3-2gpu-20261012/predictions.jsonl"),
-    ("Action", "video2-action-readout-20261013/results/ovo-action-memory-2gpu-20261013/predictions.jsonl"),
-    ("Frame-ID witness (as scored)", "video2-action-readout-20261013/results/ovo-frame-id-witness-fill-2gpu-20261014/predictions.jsonl"),
-    ("Frame-ID witness (official parser)", "video2-action-readout-20261013/results/ovo-frame-id-witness-fill-2gpu-20261014/predictions.jsonl"),
-    ("Full-context budget_pool v2", "video2-fill-full-context-20261015/results/ovo-fill-full-context-v2-2gpu-20261015/predictions.jsonl"),
+    ("Recent16 (official)", HERE / "recent16-20261012.json.gz"),
+    ("Fill (progressive_pool, 2026-10-11)", HERE / "fill-20261011.jsonl.gz"),
+    ("State v3", HERE / "state-v3-20261012.jsonl.gz"),
+    ("Action", HERE / "action-20261013.jsonl.gz"),
+    ("Frame-ID witness (as scored)", HERE / "frame-id-witness-20261014.jsonl.gz"),
+    ("Frame-ID witness (official parser)", HERE / "frame-id-witness-20261014.jsonl.gz"),
+    ("Full-context budget_pool v2", HERE / "full-context-v2-20261015.jsonl.gz"),
 ]
 
 
 def load(path):
-    path = Path(path) if Path(path).is_absolute() else M / path
-    if path.suffix == ".json":
-        data = json.load(open(path))
-        return data.get("predictions") or data.get("samples") if isinstance(data, dict) else data
-    return [json.loads(line) for line in open(path)]
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        if path.name.endswith(".json.gz"):
+            data = json.load(handle)
+            return data.get("predictions") or data.get("samples") if isinstance(data, dict) else data
+        return [json.loads(line) for line in handle]
 
 
 def rescore(row):
@@ -47,7 +47,7 @@ for name, path in RUNS:
     hit = rescore if "official parser" in name else (lambda r: r["hit"])
     acc = {s: 100 * sum(hit(r) for r in rows if r["subtask"] == s) / sum(r["subtask"] == s for r in rows) for s in GROUP}
     g = {k: sum(acc[s] for s in GROUP if GROUP[s] == k) / sum(GROUP[s] == k for s in GROUP) for k in ("BT", "RT", "FT")}
-    table.append(dict(run=name, source=str(path), overall=sum(g.values()) / 3, **g, subtasks=acc))
+    table.append(dict(run=name, source="predictions/" + path.name, overall=sum(g.values()) / 3, **g, subtasks=acc))
 
 json.dump(table, open("full_run_scores.json", "w"), indent=1)
 print("| Run | Overall | BT | RT | FT |\n|---|---:|---:|---:|---:|")

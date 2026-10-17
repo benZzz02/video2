@@ -1,7 +1,7 @@
 [
  {
   "run": "Recent16 (official)",
-  "source": "/mnt/truenas_nfs/dataset/znh1302/OneStreamer-OVO-eval/outputs/OneStreamer-4B/ovobench/ovo-full-recent16-2gpu-20261012/recent16/ovobench/predictions.json",
+  "source": "predictions/recent16-20261012.json.gz",
   "overall": 70.5274743563461,
   "BT": 75.20071391039133,
   "RT": 83.27904092493208,
@@ -23,7 +23,7 @@
  },
  {
   "run": "Fill (progressive_pool, 2026-10-11)",
-  "source": "video2/results/ovo-visual-memory-2gpu-20261011/predictions.jsonl",
+  "source": "predictions/fill-20261011.jsonl.gz",
   "overall": 73.20391989170129,
   "BT": 78.01489172456915,
   "RT": 79.47433689934196,
@@ -45,7 +45,7 @@
  },
  {
   "run": "State v3",
-  "source": "video2-state-fix-20261012/results/ovo-state-memory-v3-2gpu-20261012/predictions.jsonl",
+  "source": "predictions/state-v3-20261012.jsonl.gz",
   "overall": 72.90685242152487,
   "BT": 77.67894972196048,
   "RT": 81.17843955413011,
@@ -67,7 +67,7 @@
  },
  {
   "run": "Action",
-  "source": "video2-action-readout-20261013/results/ovo-action-memory-2gpu-20261013/predictions.jsonl",
+  "source": "predictions/action-20261013.jsonl.gz",
   "overall": 71.53537882144433,
   "BT": 77.5667162763937,
   "RT": 81.42243226625727,
@@ -89,7 +89,7 @@
  },
  {
   "run": "Frame-ID witness (as scored)",
-  "source": "video2-action-readout-20261013/results/ovo-frame-id-witness-fill-2gpu-20261014/predictions.jsonl",
+  "source": "predictions/frame-id-witness-20261014.jsonl.gz",
   "overall": 60.14511910989817,
   "BT": 52.01457567048965,
   "RT": 71.73533673340937,
@@ -111,7 +111,7 @@
  },
  {
   "run": "Frame-ID witness (official parser)",
-  "source": "video2-action-readout-20261013/results/ovo-frame-id-witness-fill-2gpu-20261014/predictions.jsonl",
+  "source": "predictions/frame-id-witness-20261014.jsonl.gz",
   "overall": 71.36516180169336,
   "BT": 78.01489172456915,
   "RT": 78.97848208804876,
@@ -133,7 +133,7 @@
  },
  {
   "run": "Full-context budget_pool v2",
-  "source": "video2-fill-full-context-20261015/results/ovo-fill-full-context-v2-2gpu-20261015/predictions.jsonl",
+  "source": "predictions/full-context-v2-20261015.jsonl.gz",
   "overall": 73.15810675828446,
   "BT": 78.01034172001914,
   "RT": 79.80845293820126,

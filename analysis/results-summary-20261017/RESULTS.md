@@ -3,7 +3,8 @@
 模型均为冻结的 OneStreamer-4B，128K 上下文。分数由 `summarize_runs.py` 从各次运行的逐题预测重新计算
 （官方口径：BT/RT/FT 内先平均子任务，再平均三类），机器可读版本为 `full_run_scores.json`。
 各次运行自带的 `summary.json` 在 `run_summaries/`（官方 Recent16 输出没有 summary，分数见 json）。
-逐题预测文件不进仓库。
+逐题预测（gzip 压缩，含原始输出、历史时间戳、近期帧时间戳等字段）在 `predictions/`，
+在仓库根目录运行 `python analysis/results-summary-20261017/summarize_runs.py` 即可复现下表。
 
 ## 全量运行
 
