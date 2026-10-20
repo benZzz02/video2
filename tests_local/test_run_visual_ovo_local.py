@@ -25,6 +25,66 @@ def sample(sid, video="a.mp4", start=0.0, end=10.0):
 
 
 class PureTests(unittest.TestCase):
+    def test_legacy_layout_defaults_and_commands_are_preserved(self):
+        parser = runner.build_parser()
+        for layout, compression, budget in [("progressive", "progressive_pool", "fixed"),
+                                             ("full_context", "budget_pool", "context")]:
+            args = parser.parse_args(["--output", "/tmp/test-output", "--memory-layout", layout])
+            config = runner.configuration(args)
+            self.assertIsNone(args.history_compression)
+            self.assertEqual(config["history_compression"], compression)
+            self.assertEqual(config["store_budget"], budget)
+            self.assertEqual(config["context_tokens"], 131072)
+            self.assertEqual(config["recent_frames"], 16)
+            cmd = runner.command(args, "/tmp/samples.json", args.output)
+            expected = ["bash", str(runner.ROOT / "run_visual_memory.sh"),
+                        "--manifest", "/tmp/samples.json", "--model-path", str(args.model_path),
+                        "--video-root", str(args.video_root), "--output", str(args.output),
+                        "--context-tokens", "131072", "--attn-implementation", "sdpa",
+                        "--history-read-mode", "fill", "--answer-prompt", "standard",
+                        "--state-history-budgets", "1024", "4096", "16384"]
+            if layout == "full_context":
+                expected += ["--history-compression", "budget_pool", "--history-store-budget", "context",
+                             "--history-store-tokens", "131072", "--history-capacity", "131072",
+                             "--history-store-mib", "4096", "--history-min-frame-tokens", "16",
+                             "--stream-include-end"]
+            self.assertEqual(cmd, expected)
+
+    def test_vcast_optin_and_temperature_match_worker_for_both_layouts(self):
+        parser = runner.build_parser()
+        for layout, budget, tokens in [("progressive", "fixed", 16384),
+                                       ("full_context", "context", 131072)]:
+            with self.subTest(layout=layout):
+                args = parser.parse_args(["--output", "/tmp/test-output", "--memory-layout", layout,
+                                          "--history-compression", "vcast", "--vcast-temperature", "0.4"])
+                config = runner.configuration(args)
+                self.assertEqual(config["history_compression"], "vcast")
+                self.assertEqual(config["vcast_temperature"], 0.4)
+                self.assertEqual(config["store_budget"], budget)
+                self.assertEqual(config["store_tokens"], tokens)
+                cmd = runner.command(args, "/tmp/samples.json", args.output)
+                for flag, expected in [("--history-compression", "vcast"),
+                                       ("--vcast-temperature", "0.4"),
+                                       ("--history-store-budget", budget),
+                                       ("--history-store-tokens", str(tokens)),
+                                       ("--history-capacity", str(config["capacity"])),
+                                       ("--history-min-frame-tokens", str(config["min_frame_tokens"]))]:
+                    self.assertEqual(cmd.count(flag), 1)
+                    self.assertEqual(cmd[cmd.index(flag) + 1], expected)
+                self.assertEqual("--stream-include-end" in cmd, layout == "full_context")
+                args.vcast_temperature = 0.7
+                self.assertNotEqual(runner.digest(config), runner.digest(runner.configuration(args)))
+
+    def test_explicit_compression_override_is_forwarded_without_changing_other_options(self):
+        parser = runner.build_parser()
+        args = parser.parse_args(["--output", "/tmp/test-output", "--history-compression", "avg_pool"])
+        config = runner.configuration(args)
+        baseline = runner.configuration(parser.parse_args(["--output", "/tmp/test-output"]))
+        self.assertEqual(config, dict(baseline, history_compression="avg_pool"))
+        cmd = runner.command(args, "/tmp/samples.json", args.output)
+        self.assertEqual(cmd[cmd.index("--history-compression") + 1], "avg_pool")
+        self.assertNotIn("--vcast-temperature", cmd)
+
     def test_readout_cli_defaults_and_worker_configuration_match(self):
         parser = runner.build_parser()
         for flags, mode, budgets in [([], "fill", [1024, 4096, 16384]),
@@ -60,7 +120,8 @@ class PureTests(unittest.TestCase):
 
     def test_untracked_controller_is_in_source_identity(self):
         names = ["Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
-                 for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py")]
+                 for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py",
+                              "vcast_memory.py", "sparse_visual_inputs.py")]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in names:

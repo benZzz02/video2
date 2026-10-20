@@ -16,6 +16,10 @@ keeps the newest N full feature bundles (--recent-frames, default 16), and spati
 (including all DeepStack branches) into a bounded CPU history bank.
 progressive_pool additionally pools each archived frame every configured age
 interval, down to one token, and drops the oldest records when caps are exceeded.
+vcast is an opt-in, training-free alternative: preserve original tokens until
+budget pressure, then allocate by temporal curvature and select spatial tokens
+with V-CAST's dual-anchor score. Original coordinates and all DeepStack branches
+remain aligned. See VCAST_MEMORY.md for the streaming adaptation and limits.
 The default
 resize mode instead encodes lower-resolution historical images and replays the
 official recent-frame decoder. resize/avg_pool use a seeded reservoir; readout
@@ -48,7 +52,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, OrderedDict, deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 import hashlib
 import heapq
@@ -65,6 +69,8 @@ from typing import Any
 VERSION = "visual_memory_v7_context_budget_pool"
 DEFAULT_CONTEXT_TOKENS = 32768
 POOLED_COMPRESSIONS = frozenset({"avg_pool", "progressive_pool", "budget_pool"})
+FEATURE_STREAM_COMPRESSIONS = POOLED_COMPRESSIONS | {"vcast"}
+VCAST_VERSION = "visual_memory_v8_vcast_streaming"
 # Safety margin for the per-stream history budget; the fill reader still
 # measures the exact prompt and drops records if this estimate is exceeded.
 HISTORY_BUDGET_MARGIN_TOKENS = 64
@@ -151,6 +157,7 @@ class MemoryConfig:
     route_threshold: float = 0.0
     route_escalation: str = "SHORT"
     short_history_tokens: int = 16384
+    vcast_temperature: float = 0.7
 
     def __post_init__(self):
         for name in ("capacity", "store_tokens", "store_bytes", "read_frames", "read_tokens"):
@@ -182,12 +189,16 @@ class MemoryConfig:
                 not isinstance(self.context_tokens, int) or isinstance(self.context_tokens, bool)
                 or self.context_tokens <= 0):
             raise ValueError("context_tokens must be a positive integer")
-        if self.history_compression not in {"resize", "avg_pool", "progressive_pool", "budget_pool"}:
+        if self.history_compression not in FEATURE_STREAM_COMPRESSIONS | {"resize"}:
             raise ValueError("Unknown history_compression mode")
+        if (not isinstance(self.vcast_temperature, (int, float))
+                or isinstance(self.vcast_temperature, bool)
+                or not math.isfinite(self.vcast_temperature) or self.vcast_temperature <= 0):
+            raise ValueError("vcast_temperature must be finite and positive")
         if not isinstance(self.pool_stride, int) or isinstance(self.pool_stride, bool) or self.pool_stride < 1:
             raise ValueError("pool_stride must be a positive integer")
-        if self.history_compression in POOLED_COMPRESSIONS and self.history_fps != 1.0:
-            raise ValueError("Feature pooling uses a shared 1-fps stream for recent frames and history")
+        if self.history_compression in FEATURE_STREAM_COMPRESSIONS and self.history_fps != 1.0:
+            raise ValueError("Feature compression uses a shared 1-fps stream for recent frames and history")
         if not math.isfinite(self.pool_age_seconds) or self.pool_age_seconds <= 0:
             raise ValueError("pool_age_seconds must be finite and positive")
         if self.history_compression in {"progressive_pool", "budget_pool"} and self.pool_stride < 2:
@@ -195,8 +206,8 @@ class MemoryConfig:
         if self.store_budget not in {"fixed", "context"}:
             raise ValueError("store_budget must be fixed or context")
         if self.store_budget == "context" and (
-                self.history_compression != "budget_pool" or self.context_tokens is None):
-            raise ValueError("store_budget=context requires budget_pool and an explicit context_tokens cap")
+                self.history_compression not in {"budget_pool", "vcast"} or self.context_tokens is None):
+            raise ValueError("store_budget=context requires budget_pool or vcast and an explicit context_tokens cap")
         if (not isinstance(self.min_frame_tokens, int) or isinstance(self.min_frame_tokens, bool)
                 or self.min_frame_tokens < 1):
             raise ValueError("min_frame_tokens must be a positive integer")
@@ -222,6 +233,8 @@ class VisualFrame:
     source_size: tuple[int, int] | None = None
     pool_source_shape: tuple[int, int] | None = None
     pool_scale: int = 1
+    # Original merged-grid row-major coordinates. None denotes a dense grid.
+    source_indices: tuple[int, ...] | None = None
 
     @property
     def token_count(self):
@@ -229,8 +242,9 @@ class VisualFrame:
 
     @property
     def nbytes(self):
-        """Tensor payload, including every DeepStack branch; not allocator RSS."""
-        return sum(x.numel() * x.element_size() for x in (self.features, *self.deepstack))
+        """Feature/coordinate payload, including DeepStack; not allocator RSS."""
+        return (sum(x.numel() * x.element_size() for x in (self.features, *self.deepstack))
+                + (8 * len(self.source_indices) if self.source_indices is not None else 0))
 
 
 def pool_visual_frame(frame: VisualFrame, stride: int = 2, merge_size: int = 2) -> VisualFrame:
@@ -244,6 +258,8 @@ def pool_visual_frame(frame: VisualFrame, stride: int = 2, merge_size: int = 2) 
     import torch
     import torch.nn.functional as F
 
+    if frame.source_indices is not None:
+        raise ValueError("Sparse selected tokens cannot be spatially pooled")
     if any(not isinstance(x, int) or isinstance(x, bool) or x < 1 for x in (stride, merge_size)):
         raise ValueError("Pooling stride and merge size must be positive integers")
     if len(frame.grid_thw) != 3 or frame.grid_thw[0] != 1:
@@ -656,8 +672,9 @@ def _engine_lock(engine):
 def cached_image_features(engine, frames: list[VisualFrame]):
     """Temporarily replace only this engine's native image-feature function.
 
-    Each record has a complete native or pooled carrier grid. Forward handles placeholder scatter,
-    DeepStack and mRoPE; no KV from another context is spliced into the decoder.
+    Dense records use the native path unchanged. Sparse records retain the
+    original grid and coordinates through a scoped mRoPE adapter. No KV from
+    another context is spliced into the decoder.
     """
     import torch
 
@@ -673,6 +690,10 @@ def cached_image_features(engine, frames: list[VisualFrame]):
         if frame.grid_thw[1] % merge or frame.grid_thw[2] % merge:
             raise ValueError("Image grid is not divisible by spatial_merge_size")
         expected = math.prod(frame.grid_thw) // merge**2
+        if frame.source_indices is not None:
+            from onestreamer.sparse_visual_inputs import validate_source_indices
+            validate_source_indices(frame, merge)
+            expected = len(frame.source_indices)
         if tuple(frame.features.shape) != (expected, hidden):
             raise ValueError("Cached final features do not match the image grid/hidden size")
         if len(frame.deepstack) != layers:
@@ -697,7 +718,13 @@ def cached_image_features(engine, frames: list[VisualFrame]):
         previous = core.__dict__.get("get_image_features", sentinel)
         core.get_image_features = get_cached
         try:
-            yield state
+            if any(frame.source_indices is not None for frame in frames):
+                from onestreamer.sparse_visual_inputs import sparse_visual_positions
+                positions = sparse_visual_positions(engine, frames)
+            else:
+                positions = nullcontext()
+            with positions:
+                yield state
         finally:
             if previous is sentinel:
                 delattr(core, "get_image_features")
@@ -756,15 +783,20 @@ class NativeFeatureAdapter:
         return result
 
     def prepare_inputs(self, chat, frames):
-        """Use the native processor for token expansion; dummy pixels never enter ViT."""
+        """Dense native expansion or sparse text-only expansion; no readout ViT."""
         import torch
         from PIL import Image
 
         engine = self.engine
-        images = [Image.new("RGB", frame.size) for frame in frames]
         prompt = engine.processor.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
-        inputs = engine.processor(text=[prompt], images=images, padding=True,
-                                  do_resize=False, truncation=False, return_tensors="pt")
+        sparse = any(frame.source_indices is not None for frame in frames)
+        if sparse:
+            from onestreamer.sparse_visual_inputs import prepare_sparse_chat_inputs
+            inputs = prepare_sparse_chat_inputs(engine, prompt, frames)
+        else:
+            images = [Image.new("RGB", frame.size) for frame in frames]
+            inputs = engine.processor(text=[prompt], images=images, padding=True,
+                                      do_resize=False, truncation=False, return_tensors="pt")
         expected_grid = torch.tensor([f.grid_thw for f in frames], dtype=torch.long)
         if not torch.equal(inputs["image_grid_thw"].cpu(), expected_grid):
             raise ValueError("Processor changed the cached image grid")
@@ -777,13 +809,18 @@ class NativeFeatureAdapter:
         # generate has expand_size=1. In this exact HF version the image branch
         # only checks pixel_values is not None before calling our validated hook.
         # Avoid copying the dummy processed image patches to the accelerator.
-        inputs.pop("pixel_values")
+        inputs.pop("pixel_values", None)
         inputs = inputs.to(engine.device)
         inputs["pixel_values"] = torch.empty(0, device=engine.device, dtype=engine.model.dtype)
         metrics = dict(input_tokens=int(inputs["input_ids"].shape[-1]), visual_tokens=count,
                        text_tokens=int(inputs["input_ids"].shape[-1]) - count,
                        image_grid_thw=expected_grid.tolist(),
                        input_image_sizes=[list(f.size) for f in frames])
+        if any(f.source_indices is not None for f in frames):
+            merge = engine.model.config.vision_config.spatial_merge_size
+            metrics.update(visual_position_mode="original_grid_sparse_mrope",
+                           image_retained_tokens=[f.token_count for f in frames],
+                           image_original_tokens=[math.prod(f.grid_thw) // merge**2 for f in frames])
         return inputs, metrics
 
     def build_chat(self, history, recent, question, direct=False):
@@ -1241,13 +1278,18 @@ def infer(job, rows, config=None, engine=None):
     for (path, origin), items in sorted(groups.items()):
         progressive = config.history_compression == "progressive_pool"
         budget_pool = config.history_compression == "budget_pool"
+        vcast = config.history_compression == "vcast"
+        if vcast:
+            from onestreamer.vcast_memory import VCastVisualMemoryBank
         bank = (ProgressiveVisualMemoryBank(config, engine.model.config.vision_config.spatial_merge_size)
                 if progressive else
                 BudgetVisualMemoryBank(config, engine.model.config.vision_config.spatial_merge_size)
-                if budget_pool else VisualMemoryBank(config))
+                if budget_pool else
+                VCastVisualMemoryBank(config, engine.model.config.vision_config.spatial_merge_size)
+                if vcast else VisualMemoryBank(config))
         # Size the bank from the first native frame, before any FIFO retirement.
-        budget_pending = budget_pool and config.store_budget == "context" and config.enabled
-        pooled_stream = config.history_compression in POOLED_COMPRESSIONS
+        budget_pending = (budget_pool or vcast) and config.store_budget == "context" and config.enabled
+        pooled_stream = config.history_compression in FEATURE_STREAM_COMPRESSIONS
         window = RecentFeatureWindow(capacity=config.recent_frames) if pooled_stream else None
         # The pooling-mode recent-only control uses the identical causal stream
         # and full-resolution FIFO, even when historical storage is disabled.
@@ -1279,7 +1321,7 @@ def infer(job, rows, config=None, engine=None):
                                 budget_pending = False
                             retired = window.observe(native)
                             if retired is not None and config.enabled:
-                                if progressive or budget_pool:
+                                if progressive or budget_pool or vcast:
                                     bank.observe(retired, now=sampler.observation_time)
                                 else:
                                     compressed = pool_visual_frame(
@@ -1406,7 +1448,7 @@ def infer(job, rows, config=None, engine=None):
                 qa_seconds = time.perf_counter() - qa_start
                 parsed, hit = score_prediction(sample, prediction)
                 yield dict(row, model_alias=job.get("model", Path(job["model_path"]).name),
-                           variant=(f"{VERSION}_{config.history_compression}_{config.read_mode}_r{config.recent_frames}"
+                           variant=(f"{VCAST_VERSION if vcast else VERSION}_{config.history_compression}_{config.read_mode}_r{config.recent_frames}"
                                     + (f"_recent{config.recent_frames}_control" if not config.enabled else "")
                                     + ("_frame_id_witness_v2" if frame_evidence is not None else "")),
                            prediction=prediction, parsed_output=parsed, hit=hit,
@@ -1478,7 +1520,7 @@ def main(argv=None):
     parser.add_argument("--recent-frames", type=int, default=16,
                         help="Full-feature recent window size; historical pooling starts only upon FIFO eviction")
     parser.add_argument("--history-capacity", type=int,
-                        help="Frame cap; defaults to token cap for progressive_pool, otherwise 64; 0 disables history")
+                        help="Frame cap; defaults to token cap for progressive_pool/budget_pool/vcast, otherwise 64; 0 disables history")
     parser.add_argument("--history-store-tokens", type=int, default=16384)
     parser.add_argument("--history-store-mib", type=float, default=512)
     parser.add_argument("--history-read-frames", type=int, default=4)
@@ -1497,15 +1539,17 @@ def main(argv=None):
                         help="Total context cap including answer reserve; default: 32768 (32K)")
     parser.add_argument("--history-fps", type=float, default=1.0)
     parser.add_argument("--history-max-pixels", type=int, default=262144)
-    parser.add_argument("--history-compression", choices=("resize", "avg_pool", "progressive_pool", "budget_pool"),
+    parser.add_argument("--history-compression", choices=("resize", "avg_pool", "progressive_pool", "budget_pool", "vcast"),
                         default="resize",
                         help="progressive_pool repeatedly compresses aged frames; avg_pool compresses once on FIFO "
-                             "eviction; budget_pool coarsens the oldest finest records only under budget pressure")
+                             "eviction; budget_pool coarsens records under pressure; vcast selects original tokens")
+    parser.add_argument("--vcast-temperature", type=float, default=0.7,
+                        help="vcast temporal-curvature allocation temperature (positive; default 0.7)")
     parser.add_argument("--history-store-budget", choices=("fixed", "context"), default="fixed",
-                        help="context sizes the budget_pool bank per stream to the context left after recent "
+                        help="context sizes the budget_pool/vcast bank per stream to the context left after recent "
                              "frames, the longest question prompt and the answer reserve")
     parser.add_argument("--history-min-frame-tokens", type=int, default=16,
-                        help="budget_pool stops spatial pooling at this size, then thins records uniformly in time")
+                        help="Per-frame floor before budget_pool/vcast thins records uniformly in time")
     parser.add_argument("--stream-include-end", action="store_true",
                         help="Sample the slot at the question time using the last source frame before it, "
                              "matching the official end-aligned final recent frame")
@@ -1529,7 +1573,7 @@ def main(argv=None):
         parser.error("--history-store-mib must be finite and nonnegative")
     capacity = args.history_capacity
     if capacity is None:
-        capacity = (args.history_store_tokens if args.history_compression in {"progressive_pool", "budget_pool"}
+        capacity = (args.history_store_tokens if args.history_compression in {"progressive_pool", "budget_pool", "vcast"}
                     else 64)
     config = MemoryConfig(
         capacity=capacity, store_tokens=args.history_store_tokens,
@@ -1542,7 +1586,8 @@ def main(argv=None):
         state_history_budgets=tuple(args.state_history_budgets), answer_prompt=args.answer_prompt,
         store_budget=args.history_store_budget, min_frame_tokens=args.history_min_frame_tokens,
         stream_include_end=args.stream_include_end, route_threshold=args.route_threshold,
-        route_escalation=args.route_escalation, short_history_tokens=args.short_history_tokens)
+        route_escalation=args.route_escalation, short_history_tokens=args.short_history_tokens,
+        vcast_temperature=args.vcast_temperature)
     if config.answer_prompt == "frame_id_witness":
         from onestreamer.frame_evidence import ANSWER_RESERVE_TOKENS, PROMPT_VERSION
         answer_tokens, recent_prompt = ANSWER_RESERVE_TOKENS, PROMPT_VERSION
@@ -1583,23 +1628,27 @@ def main(argv=None):
     job = dict(model=original.get("model", Path(model_path).name), model_path=model_path,
                device=args.device, dtype=args.dtype, attn_implementation=args.attn_implementation,
                video_root=str(args.video_root or original.get("video_root", ".")))
-    pooled_stream = config.history_compression in POOLED_COMPRESSIONS
+    pooled_stream = config.history_compression in FEATURE_STREAM_COMPRESSIONS
     progressive = config.history_compression == "progressive_pool"
     budget_pool = config.history_compression == "budget_pool"
-    manifest = dict(version=VERSION, config=asdict(config), job=job, samples=rows,
+    vcast = config.history_compression == "vcast"
+    manifest = dict(version=VCAST_VERSION if vcast else VERSION, config=asdict(config), job=job, samples=rows,
                     source_manifest=str((args.manifest or args.samples).resolve()),
                     protocol=dict(recent_frames=config.recent_frames, recent_fps=1.0,
                                   answer_tokens=answer_tokens,
                                   answer_prompt=config.answer_prompt,
                                   caption_generation=False, history_sampling=("fixed_origin_causal_end_inclusive"
                                                     if config.stream_include_end else "fixed_origin_causal"),
-                                  history_storage=("pooled_native_features_with_deepstack" if pooled_stream
+                                  history_storage=("selected_original_tokens_with_deepstack_and_coordinates" if vcast else
+                                                   "pooled_native_features_with_deepstack" if pooled_stream
                                                    else "native_full_image_features_with_deepstack"),
-                                  history_write=("on_recent_fifo_eviction_then_age_pool" if progressive else
+                                  history_write=("on_recent_fifo_eviction_then_budget_select" if vcast else
+                                                 "on_recent_fifo_eviction_then_age_pool" if progressive else
                                                  "on_recent_fifo_eviction_then_budget_pool" if budget_pool else
                                                  "on_recent_fifo_eviction" if pooled_stream
                                                  else "on_observation"),
-                                  history_selection=("age_pool_then_drop_oldest_at_caps" if progressive
+                                  history_selection=("causal_curvature_budget_and_dual_anchor_tokens" if vcast else
+                                                     "age_pool_then_drop_oldest_at_caps" if progressive
                                                      else "coarsen_oldest_finest_then_uniform_thin" if budget_pool
                                                      else "seeded_priority_reservoir"),
                                   read_selection=("native_state_progressive_visual_read" if config.read_mode == "state" else
@@ -1612,7 +1661,8 @@ def main(argv=None):
                                   recent_prompt=recent_prompt,
                                   runtime_seconds=("cached_recent_readout_plus_qa" if pooled_stream
                                                    else "recent_decode_encode_readout_plus_qa"),
-                                  storage_bytes="tensor_payload_including_deepstack"))
+                                  storage_bytes=("feature_coordinate_and_selector_payload" if vcast else
+                                                 "tensor_payload_including_deepstack")))
     if config.answer_prompt == "frame_id_witness":
         manifest["protocol"].update(
             witness_prompt=recent_prompt,
@@ -1636,6 +1686,15 @@ def main(argv=None):
                                    action_budgets_include_initial_zero=True,
                                    action_timing="included_in_recent_preparation_and_runtime_seconds")
     source_paths = [Path(__file__)]
+    if vcast:
+        source_paths.extend(Path(__file__).with_name(name)
+                            for name in ("vcast_memory.py", "sparse_visual_inputs.py"))
+        manifest["protocol"].update(
+            compression_reference="xinyouu/V-CAST@f15d2764e2381e0344fea9eb6228a4a58654f4f7",
+            compression_variant="causal_pressure_only_irreversible_selection_v1",
+            visual_positions="original_merged_grid_coordinates",
+            temporal_allocation="observed_retained_frame_curvature_softmax",
+            min_frame_tokens_policy="thin_frames_before_relaxing_last_frame_floor")
     if config.read_mode in {"state", "action"}:
         source_paths.append(Path(__file__).with_name("state_readout.py"))
     if config.read_mode == "action":

@@ -55,6 +55,11 @@ def configuration(args):
     values = dict(CONFIG)
     if getattr(args, "memory_layout", "progressive") == "full_context":
         values.update(FULL_CONTEXT_LAYOUT)
+    compression = getattr(args, "history_compression", None)
+    if compression is not None:
+        values["history_compression"] = compression
+    if values["history_compression"] == "vcast":
+        values["vcast_temperature"] = getattr(args, "vcast_temperature", 0.7)
     values.update(read_mode=getattr(args, "history_read_mode", "fill"),
                   answer_prompt=getattr(args, "answer_prompt", "standard"),
                   state_history_budgets=tuple(getattr(
@@ -81,7 +86,8 @@ def source_hashes():
         ["git", "ls-files", "-z", "Eval", "run_visual_memory.sh"], cwd=ROOT).decode().split("\0")
     sources = {name: file_sha(ROOT / name) for name in tracked if name and (ROOT / name).is_file()}
     # New local modules must participate in resume identity before a git add.
-    for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py"):
+    for name in ("state_readout.py", "action_readout.py", "frame_evidence.py", "question_router.py",
+                 "vcast_memory.py", "sparse_visual_inputs.py"):
         controller = "Eval/Proactive_Eval/OneStreamer/src/onestreamer/" + name
         sources[controller] = file_sha(ROOT / controller)
     sources["tools/run_visual_ovo_local.py"] = file_sha(Path(__file__).resolve())
@@ -237,13 +243,17 @@ def command(args, samples, output):
             "--attn-implementation", "sdpa", "--history-read-mode", config["read_mode"],
             "--answer-prompt", config["answer_prompt"],
             "--state-history-budgets", *map(str, config["state_history_budgets"]),
-            *(["--history-compression", config["history_compression"],
-               "--history-store-budget", config["store_budget"],
+            *(["--history-compression", config["history_compression"]]
+              if (getattr(args, "history_compression", None) is not None
+                  or config["history_compression"] in {"budget_pool", "vcast"}) else []),
+            *(["--history-store-budget", config["store_budget"],
                "--history-store-tokens", str(config["store_tokens"]),
                "--history-capacity", str(config["capacity"]),
                "--history-store-mib", str(config["store_bytes"] // 1024**2),
                "--history-min-frame-tokens", str(config["min_frame_tokens"])]
-              if config["history_compression"] == "budget_pool" else []),
+              if config["history_compression"] in {"budget_pool", "vcast"} else []),
+            *(["--vcast-temperature", str(config["vcast_temperature"])]
+              if config["history_compression"] == "vcast" else []),
             *(["--stream-include-end"] if config["stream_include_end"] else []),
             *(["--route-threshold", str(config["route_threshold"]), "--route-escalation",
                config["route_escalation"], "--short-history-tokens", str(config["short_history_tokens"])]
@@ -446,6 +456,12 @@ def build_parser():
                         help="Strictly increasing positive historical visual-token budgets after the recent-only probe")
     parser.add_argument("--memory-layout", choices=("progressive", "full_context"), default="progressive",
                         help="full_context: budget-pooled history sized to the context, end-inclusive stream")
+    parser.add_argument("--history-compression",
+                        choices=("resize", "avg_pool", "progressive_pool", "budget_pool", "vcast"),
+                        default=None,
+                        help="Override the layout's compression; vcast opts into training-free sparse history")
+    parser.add_argument("--vcast-temperature", type=float, default=0.7,
+                        help="Temporal allocation temperature used only by --history-compression vcast")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser

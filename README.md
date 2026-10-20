@@ -6,6 +6,8 @@
 
 **训练机运行说明：[RUN_VISUAL_MEMORY.md](RUN_VISUAL_MEMORY.md)**
 
+新增可选历史压缩：[`--history-compression vcast`](VCAST_MEMORY.md) 按时间曲率分配预算、保留原始视觉 token；默认行为不变。
+
 ```bash
 bash run_visual_memory.sh \
   --manifest /path/to/official/manifest.json \
