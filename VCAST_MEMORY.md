@@ -13,6 +13,13 @@
 
 空间选择可能保留小物体、局部变化等原有池化会混合掉的证据，但分数不是语义正确性的保证，需要实际任务验证。
 
+## 适配主方法（2026-10-20）
+
+1. **延迟取出，结果不变。** 每帧的打分在进入记忆时就固定，平分时按原位置先后排序，所以任意一次保留的都是同一个排序的前 k 个，少保留的集合总是多保留的子集。存储只记录每帧保留数 `keep`；驻留的行数达到 `keep` 两倍时才真正取出，读取前也会取出。原来存储满后每进一帧都要把所有旧帧复制一遍。300 条随机流上与原实现逐项一致（保留位置、特征、统计）。237 帧 1080p 的 CPU 模拟中，建记忆从 60.7 s 降到 14.0 s。统计量按保留数计算；驻留量另记为 `resident_tokens`，最多为保留数的两倍。
+2. **"刚才"路径覆盖的帧与主方法相同。** `budget_pool` 的最新历史帧都是 2×2 池化后的大小，"刚才"读取的是能放进 16K token 的最新若干帧。V-CAST 版先按池化后的大小选出同一批帧，若这批帧的保留 token 超过 16K，就按同样的曲率分配和帧内打分压进 16K（只在读取时选择，不改存储）。两种存储因此读取同样的时间范围、同样的 token 上限，只有帧内保留什么不同。逐题记录的 `route` 新增 `short_frames`、`short_pooled_span_tokens`、`short_retained_tokens`、`short_read_tokens`。
+
+3. **最新历史帧使用真实曲率。** 帧离开最近窗口时，它的后一帧已经在最近窗口里（已观察到），用它计算这帧的曲率，后一帧本身不分配权重。原来最新历史帧按端点曲率 1 第一次分配，之后真实曲率更高也无法加回 token，结果越早的帧保留越多（ovo-0012 按时间四段平均每帧 463/457/369/301，ovo-0166 为 255/238/230/189）。400 帧模拟中，修改前逐帧与"按最终曲率一次分配"的相关为 0.37，修改后 399 帧全部一致。
+
 ## 与原版 V-CAST 的关系
 
 参考[官方 Qwen3-VL 实现](https://github.com/xinyouu/V-CAST/blob/f15d2764e2381e0344fea9eb6228a4a58654f4f7/compressor/v_cast/modeling_qwen3_vl_v_cast.py)，固定参考提交 `f15d2764e2381e0344fea9eb6228a4a58654f4f7`。
@@ -49,7 +56,7 @@ python tools/run_visual_ovo_local.py \
 
 ## 检查记录
 
-新运行版本标识为 `visual_memory_v8_vcast_streaming`。manifest 记录参考提交、适配方式及两个新模块的源码散列。逐题记录沿用 `history_timestamps`、`history_frame_tokens` 和 `history_visual_tokens`，新增 bank 统计：
+新运行版本标识为 `visual_memory_v10_vcast_streaming`。manifest 记录参考提交、适配方式及两个新模块的源码散列。逐题记录沿用 `history_timestamps`、`history_frame_tokens` 和 `history_visual_tokens`，新增 bank 统计：
 
 - `selection_operations`、`selection_input_tokens`、`selection_output_tokens`：历史 token 选择次数及累计输入输出数。
 - `stored_feature_bytes`、`metadata_bytes`、`stored_bytes`：特征与位置、选择所需元数据、两者总量。总量受字节上限约束，不代表 Python 对象或分配器的实际内存占用。

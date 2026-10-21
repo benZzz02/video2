@@ -70,7 +70,7 @@ VERSION = "visual_memory_v7_context_budget_pool"
 DEFAULT_CONTEXT_TOKENS = 32768
 POOLED_COMPRESSIONS = frozenset({"avg_pool", "progressive_pool", "budget_pool"})
 FEATURE_STREAM_COMPRESSIONS = POOLED_COMPRESSIONS | {"vcast"}
-VCAST_VERSION = "visual_memory_v8_vcast_streaming"
+VCAST_VERSION = "visual_memory_v10_vcast_streaming"
 # Safety margin for the per-stream history budget; the fill reader still
 # measures the exact prompt and drops records if this estimate is exceeded.
 HISTORY_BUDGET_MARGIN_TOKENS = 64
@@ -1321,7 +1321,10 @@ def infer(job, rows, config=None, engine=None):
                                 budget_pending = False
                             retired = window.observe(native)
                             if retired is not None and config.enabled:
-                                if progressive or budget_pool or vcast:
+                                if vcast:
+                                    # The oldest recent frame is the observed successor of the retired one.
+                                    bank.observe(retired, now=sampler.observation_time, successor=window.frames()[0])
+                                elif progressive or budget_pool:
                                     bank.observe(retired, now=sampler.observation_time)
                                 else:
                                     compressed = pool_visual_frame(
@@ -1381,8 +1384,14 @@ def infer(job, rows, config=None, engine=None):
                     if routed_answer is not None:
                         history = []
                     else:
-                        candidates = bank.candidates(before=recent[0].timestamp)
-                        if final_scope == "SHORT":
+                        if final_scope == "SHORT" and vcast:
+                            # Same frames as the budget_pool SHORT read, fitted to the same cap.
+                            candidates, short_meta = bank.short_history(recent[0].timestamp,
+                                                                        config.short_history_tokens)
+                            route.update(short_meta)
+                        else:
+                            candidates = bank.candidates(before=recent[0].timestamp)
+                        if final_scope == "SHORT" and not vcast:
                             candidates = question_router.newest_history(candidates, config.short_history_tokens)
                         history, fill_meta = adapter.select_history(
                             candidates, recent, question, direct=direct,
@@ -1693,8 +1702,10 @@ def main(argv=None):
             compression_reference="xinyouu/V-CAST@f15d2764e2381e0344fea9eb6228a4a58654f4f7",
             compression_variant="causal_pressure_only_irreversible_selection_v1",
             visual_positions="original_merged_grid_coordinates",
-            temporal_allocation="observed_retained_frame_curvature_softmax",
-            min_frame_tokens_policy="thin_frames_before_relaxing_last_frame_floor")
+            temporal_allocation="observed_retained_frame_curvature_softmax_with_observed_successor",
+            min_frame_tokens_policy="thin_frames_before_relaxing_last_frame_floor",
+            selection_materialization="lazy_prefix_of_fixed_score_ranking_trim_at_2x",
+            short_history_read="budget_pool_pooled_span_then_vcast_fit_to_cap")
     if config.read_mode in {"state", "action"}:
         source_paths.append(Path(__file__).with_name("state_readout.py"))
     if config.read_mode == "action":

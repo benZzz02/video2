@@ -19,8 +19,13 @@ from typing import Any
 from .visual_memory import MemoryConfig, VisualFrame, VisualMemoryBank
 
 
-def temporal_weights(frame_means, temperature: float = 0.7):
-    """V-CAST curvature softmax; means must describe original complete frames."""
+def temporal_weights(frame_means, temperature: float = 0.7, successor=None):
+    """V-CAST curvature softmax; means must describe original complete frames.
+
+    ``successor`` is the mean of an already observed frame after the last one
+    (in a stream, the oldest recent frame). It gives the last frame its real
+    curvature instead of the endpoint value; it receives no weight itself.
+    """
     import torch
     import torch.nn.functional as F
 
@@ -31,12 +36,13 @@ def temporal_weights(frame_means, temperature: float = 0.7):
     count = len(frame_means)
     if count == 0:
         return frame_means.new_empty(0, dtype=torch.float32)
-    curvature = torch.ones(count, device=frame_means.device, dtype=torch.float32)
-    if count > 2:
-        incoming = frame_means[1:-1] - frame_means[:-2]
-        outgoing = frame_means[2:] - frame_means[1:-1]
+    path = frame_means if successor is None else torch.cat([frame_means, successor.reshape(1, -1).to(frame_means)])
+    curvature = torch.ones(len(path), device=frame_means.device, dtype=torch.float32)
+    if len(path) > 2:
+        incoming = path[1:-1] - path[:-2]
+        outgoing = path[2:] - path[1:-1]
         curvature[1:-1] = 1 - F.cosine_similarity(incoming, outgoing, dim=-1, eps=1e-6)
-    return torch.softmax(curvature / temperature, dim=0)
+    return torch.softmax(curvature[:count] / temperature, dim=0)
 
 
 def allocate_tokens(weights, capacities, budget, floors, *, token_bytes=None, byte_budget=None):
@@ -100,22 +106,37 @@ def allocate_tokens(weights, capacities, budget, floors, *, token_bytes=None, by
 
 @dataclass
 class _Record:
+    """``frame``/``scores`` hold resident rows; only the top ``keep`` by score are retained.
+
+    Scores are fixed at admission and ties break by source order, so every
+    selection keeps a prefix of one ranking: a smaller selection is always a
+    subset of a larger one. Shrinking ``keep`` is therefore exact without
+    copying; resident rows are gathered lazily (see ``_trim``).
+    """
     frame: VisualFrame
     original_mean: Any
     scores: Any
+    keep: int
+    native: int
+
+    @property
+    def payload_bytes(self):
+        return sum(x.shape[1] * x.element_size() for x in (self.frame.features, *self.frame.deepstack))
+
+    @property
+    def feature_bytes(self):
+        return (self.payload_bytes + (8 if self.keep < self.native else 0)) * self.keep
 
     @property
     def metadata_bytes(self):
-        return sum(x.numel() * x.element_size() for x in (self.original_mean, self.scores))
+        return self.mean_bytes + self.keep * self.scores.element_size()
 
     def token_bytes(self, floor):
         # Reserve int64 coordinates only if present or if allocation can make
         # the frame sparse. A dense frame fixed at its full token count needs
         # no coordinates; charging them could falsely make feasible floors fail.
-        frame = self.frame
-        payload = sum(x.shape[1] * x.element_size() for x in (frame.features, *frame.deepstack))
-        coordinates = 8 if frame.source_indices is not None or frame.token_count > floor else 0
-        return payload + self.scores.element_size() + coordinates
+        coordinates = 8 if self.keep < self.native or self.keep > floor else 0
+        return self.payload_bytes + self.scores.element_size() + coordinates
 
     @property
     def mean_bytes(self):
@@ -147,6 +168,7 @@ class VCastVisualMemoryBank:
         self.token_budget = config.store_tokens
         self.frame_overhead = 0
         self._records = []
+        self._successor = None
         self._last_timestamp = -math.inf
         self._seen = self._dropped = self._oversize = self._operations = 0
         self._selection_input_tokens = self._selection_output_tokens = 0
@@ -183,7 +205,26 @@ class VCastVisualMemoryBank:
             scores = 1 - cosine + (norms - norms.min()) / (norms.max() - norms.min() + 1e-6)
             owned = [x.detach().to(device="cpu", copy=True) for x in branches]
             return _Record(replace(frame, features=owned[0], deepstack=tuple(owned[1:])),
-                           mean.to(device="cpu", copy=True), scores.to(device="cpu", copy=True))
+                           mean.to(device="cpu", copy=True), scores.to(device="cpu", copy=True),
+                           keep=expected, native=expected)
+
+    def _weights(self, records):
+        """Curvature weights of ``records`` taken in the context of all retained frames.
+
+        Selection is irreversible, so a frame first sized with the endpoint
+        curvature could never regain tokens once its real curvature is known.
+        The observed successor of the newest record supplies that curvature.
+        """
+        import torch
+
+        if not records:
+            return []
+        means = torch.stack([r.original_mean for r in self._records])
+        weights = temporal_weights(means, self.temperature, self._successor).tolist()
+        if len(records) == len(self._records):
+            return weights
+        index = {id(r): k for k, r in enumerate(self._records)}
+        return [weights[index[id(r)]] for r in records]
 
     def _drop_temporal_redundancy(self):
         times = [r.frame.timestamp for r in self._records]
@@ -193,8 +234,9 @@ class VCastVisualMemoryBank:
         self._dropped += 1
 
     def _totals(self):
-        tokens = sum(r.frame.token_count for r in self._records)
-        features = sum(r.frame.nbytes for r in self._records)
+        # Retained (logical) sizes; resident rows may lag until the next trim.
+        tokens = sum(r.keep for r in self._records)
+        features = sum(r.feature_bytes for r in self._records)
         metadata = sum(r.metadata_bytes for r in self._records)
         return tokens, features, metadata
 
@@ -204,30 +246,45 @@ class VCastVisualMemoryBank:
                 or tokens + self.frame_overhead * len(self._records) > self.token_budget
                 or features + metadata > self.config.store_bytes)
 
-    def _select(self, record, keep):
+    @staticmethod
+    def _gather(record, keep):
+        """The top-``keep`` resident rows by score, in source order, as a frame."""
         import torch
 
         old = record.frame
         if keep == old.token_count:
-            return
-        if not 0 < keep < old.token_count:
-            raise ValueError("Selection must retain between one and the current number of tokens")
+            return old, record.scores
         # Stable score sorting selects earlier source indices on exact ties.
         chosen = torch.argsort(record.scores, descending=True, stable=True)[:keep].sort().values
         source = old.source_indices if old.source_indices is not None else tuple(range(old.token_count))
         indices = tuple(source[i] for i in chosen.tolist())
         with torch.inference_mode():
-            record.frame = replace(old, features=old.features.index_select(0, chosen),
-                                   deepstack=tuple(x.index_select(0, chosen) for x in old.deepstack),
-                                   source_indices=indices)
-            record.scores = record.scores.index_select(0, chosen)
+            frame = replace(old, features=old.features.index_select(0, chosen),
+                            deepstack=tuple(x.index_select(0, chosen) for x in old.deepstack),
+                            source_indices=indices)
+            return frame, record.scores.index_select(0, chosen)
+
+    def _trim(self, record):
+        if record.frame.token_count != record.keep:
+            record.frame, record.scores = self._gather(record, record.keep)
+
+    def _select(self, record, keep):
+        old = record.keep
+        if keep == old:
+            return
+        if not 0 < keep < old:
+            raise ValueError("Selection must retain between one and the current number of tokens")
+        record.keep = keep
+        # Gathering on every reduction copied each record once per new frame
+        # under pressure; gather only once resident rows reach twice the
+        # retained count (and before any read), bounding residency to 2x.
+        if record.frame.token_count >= 2 * keep:
+            self._trim(record)
         self._operations += 1
-        self._selection_input_tokens += old.token_count
+        self._selection_input_tokens += old
         self._selection_output_tokens += keep
 
     def _enforce(self):
-        import torch
-
         if not self._over():
             return
         while len(self._records) > self.config.capacity:
@@ -237,7 +294,7 @@ class VCastVisualMemoryBank:
             # charge hypothetical sparse coordinates to a now-fitting dense bank.
             if not self._over():
                 return
-            capacities = [r.frame.token_count for r in self._records]
+            capacities = [r.keep for r in self._records]
             floors = [min(self.config.min_frame_tokens, n) for n in capacities]
             token_limit = self.token_budget - self.frame_overhead * len(self._records)
             byte_limit = self.config.store_bytes - sum(r.mean_bytes for r in self._records)
@@ -257,8 +314,7 @@ class VCastVisualMemoryBank:
                 else:
                     self._drop_temporal_redundancy()
                     continue
-            means = torch.stack([r.original_mean for r in self._records])
-            weights = temporal_weights(means, self.temperature).tolist()
+            weights = self._weights(self._records)
             allocated = allocate_tokens(weights, capacities, token_limit, floors,
                                         token_bytes=costs, byte_budget=byte_limit)
             for record, keep in zip(self._records, allocated):
@@ -267,15 +323,28 @@ class VCastVisualMemoryBank:
         if self._over():
             raise RuntimeError("V-CAST selection violated a hard history budget")
 
-    def observe(self, frame: VisualFrame, now: float | None = None):
+    def observe(self, frame: VisualFrame, now: float | None = None, successor: VisualFrame | None = None):
+        """Archive ``frame``; ``successor`` is the already observed next frame (oldest recent frame)."""
+        import torch.nn.functional as F
+
         if (not math.isfinite(frame.timestamp) or frame.timestamp <= self._last_timestamp
                 or (now is not None and (not math.isfinite(now) or frame.timestamp > now))):
             raise ValueError("Archived timestamps must increase and not exceed current time")
+        if successor is not None and (successor.timestamp <= frame.timestamp
+                                      or (now is not None and successor.timestamp > now)):
+            raise ValueError("The successor must follow the archived frame and be already observed")
         if not self.config.enabled:
             self._last_timestamp = frame.timestamp
             self._seen += 1
             return
         record = self._new_record(frame)
+        if successor is not None:
+            if successor.features.shape[1] != record.original_mean.numel():
+                raise ValueError("The successor must use the same feature dimension")
+            mean = F.normalize(successor.features.detach().float().mean(dim=0), dim=0, eps=1e-6)
+            self._successor = mean.to(device="cpu", copy=True)
+        else:
+            self._successor = None
         self._last_timestamp = frame.timestamp
         self._seen += 1
         was_empty = not self._records
@@ -287,13 +356,48 @@ class VCastVisualMemoryBank:
     def candidates(self, before: float):
         if not math.isfinite(before):
             raise ValueError("History cutoff must be finite")
-        return [r.frame for r in self._records if r.frame.timestamp < before]
+        selected = [r for r in self._records if r.frame.timestamp < before]
+        for record in selected:
+            self._trim(record)
+        return [r.frame for r in selected]
+
+    def short_history(self, before: float, max_visual_tokens: int):
+        """The newest frames a ``budget_pool`` bank would give the SHORT read, fitted to its cap.
+
+        ``budget_pool`` stores the newest history frames 2x2-pooled, so SHORT
+        covers the newest frames whose pooled sizes fit ``max_visual_tokens``.
+        The same frames are selected here; if their retained tokens exceed the
+        cap, curvature allocation and spatial scores fit them into it without
+        modifying the bank. Returns (frames, metadata).
+        """
+        if not isinstance(max_visual_tokens, int) or isinstance(max_visual_tokens, bool) or max_visual_tokens < 1:
+            raise ValueError("SHORT history cap must be a positive integer")
+        stride = self.config.pool_stride
+        pooled = lambda grid: (math.ceil(grid[1] // self.merge_size / stride)
+                               * math.ceil(grid[2] // self.merge_size / stride))
+        chosen, span = [], 0
+        for record in reversed([r for r in self._records if r.frame.timestamp < before]):
+            cost = pooled(record.frame.grid_thw)
+            if span + cost > max_visual_tokens:
+                break
+            chosen.append(record)
+            span += cost
+        chosen.reverse()
+        keeps = [r.keep for r in chosen]
+        retained = sum(keeps)
+        if retained > max_visual_tokens:
+            # Floors never exceed the pooled sizes, whose sum fits the cap.
+            floors = [min(self.config.min_frame_tokens, k, pooled(r.frame.grid_thw)) for r, k in zip(chosen, keeps)]
+            keeps = allocate_tokens(self._weights(chosen), keeps, max_visual_tokens, floors)
+        frames = [self._gather(r, k)[0] for r, k in zip(chosen, keeps)]
+        return frames, dict(short_frames=len(frames), short_pooled_span_tokens=span,
+                            short_retained_tokens=retained, short_read_tokens=sum(keeps))
 
     read = VisualMemoryBank.read
 
     def stats(self):
         tokens, features, metadata = self._totals()
-        counts = [r.frame.token_count for r in self._records]
+        counts = [r.keep for r in self._records]
         return dict(seen=self._seen, stored_frames=len(self._records), stored_tokens=tokens,
                     stored_bytes=features + metadata, stored_feature_bytes=features,
                     metadata_bytes=metadata, skipped_oversize=self._oversize,
@@ -303,4 +407,5 @@ class VCastVisualMemoryBank:
                     token_budget=self.token_budget, frame_overhead=self.frame_overhead,
                     budget_cost=tokens + self.frame_overhead * len(self._records),
                     earliest_timestamp=self._records[0].frame.timestamp if self._records else None,
-                    frame_tokens_min=min(counts, default=0), frame_tokens_max=max(counts, default=0))
+                    frame_tokens_min=min(counts, default=0), frame_tokens_max=max(counts, default=0),
+                    resident_tokens=sum(r.frame.token_count for r in self._records))

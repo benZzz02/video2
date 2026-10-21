@@ -277,5 +277,67 @@ class VCastMemoryTests(unittest.TestCase):
         self.assertTrue(selected)
 
 
+    def test_short_history_matches_budget_pool_span_and_fits_cap(self):
+        from onestreamer.question_router import newest_history
+        from onestreamer.visual_memory import BudgetVisualMemoryBank
+
+        pooled = BudgetVisualMemoryBank(MemoryConfig(
+            history_compression="budget_pool", capacity=1000, store_tokens=10_000,
+            store_bytes=1 << 30, min_frame_tokens=2), merge_size=2)
+        memory = bank(tokens=10_000)
+        for timestamp in range(12):
+            frame = native_frame(timestamp, height=8, width=8)
+            pooled.observe(frame)
+            memory.observe(frame)
+        # 2x2 pooling makes 16 tokens per frame: a cap of 50 covers the newest 3.
+        expected = [f.timestamp for f in newest_history(pooled.candidates(11), 50)]
+        before = [(f.timestamp, f.token_count) for f in memory.candidates(12)]
+        frames, meta = memory.short_history(11, 50)
+        self.assertEqual([f.timestamp for f in frames], expected)
+        self.assertEqual(expected, [8.0, 9.0, 10.0])
+        self.assertLessEqual(sum(f.token_count for f in frames), 50)
+        self.assertEqual(meta["short_retained_tokens"], 3 * 64)
+        self.assertEqual(meta["short_read_tokens"], sum(f.token_count for f in frames))
+        for frame in frames:
+            stored = next(f for f in memory.candidates(12) if f.timestamp == frame.timestamp)
+            torch.testing.assert_close(frame.features, stored.features[list(frame.source_indices)])
+        self.assertEqual([(f.timestamp, f.token_count) for f in memory.candidates(12)], before)
+
+    def test_lazy_selection_matches_eager_gathering(self):
+        eager, lazy = bank(tokens=40), bank(tokens=40)
+        for timestamp in range(30):
+            frame = native_frame(timestamp)
+            eager.observe(frame)
+            eager.candidates(timestamp + 1)  # gather after every frame
+            lazy.observe(frame)
+        a, b = eager.candidates(30), lazy.candidates(30)
+        self.assertEqual([(f.timestamp, f.source_indices) for f in a], [(f.timestamp, f.source_indices) for f in b])
+        for x, y in zip(a, b):
+            torch.testing.assert_close(x.features, y.features)
+        stats = [m.stats() for m in (eager, lazy)]
+        self.assertEqual(stats[0], stats[1])
+
+
+    def test_successor_curvature_keeps_streaming_allocation_proportional(self):
+        generator = torch.Generator().manual_seed(7)
+        walk, frames = torch.zeros(6), []
+        for timestamp in range(80):
+            # Back-and-forth motion: interior curvature mostly above the endpoint value 1.
+            walk = walk + 0.3 * torch.randn(6, generator=generator) + (2 * (timestamp % 2) - 1) * torch.ones(6)
+            features = walk + torch.randn(64, 6, generator=generator)
+            frames.append(VisualFrame(float(timestamp), (1, 16, 16), features, (features + 1,), (448, 448)))
+        memory = bank(tokens=1200, min_frame_tokens=2)
+        for frame, successor in zip(frames, frames[1:]):
+            memory.observe(frame, now=successor.timestamp, successor=successor)
+        kept = [f.token_count for f in memory.candidates(1e9)]
+        means = torch.stack([r.original_mean for r in memory._records])
+        weights = temporal_weights(means, successor=memory._successor).tolist()
+        ideal = allocate_tokens(weights, [64] * len(kept), 1200, [2] * len(kept))
+        self.assertEqual(sum(kept), sum(ideal))
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(kept, ideal)), 1)
+        with self.assertRaises(ValueError):
+            memory.observe(frames[-1], now=100.0, successor=frames[0])
+
+
 if __name__ == "__main__":
     unittest.main()
